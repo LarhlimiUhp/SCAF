@@ -102,7 +102,6 @@ class ExperimentConfig:
     # ---- Output ----
     output_dir: str = "results"
     experiment_name: str = "scaf_experiment"
-    n_top_features: int = 40           # redundant but kept for config compat
 
 
 # ---------------------------------------------------------------------------

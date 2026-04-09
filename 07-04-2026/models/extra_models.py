@@ -53,7 +53,7 @@ class XGBoostModel(BaseModel):
     ):
         super().__init__('XGBoost')
         try:
-            from xgboost import XGBClassifier  # noqa: PLC0415
+            from xgboost import XGBClassifier
             self._raw = XGBClassifier(
                 n_estimators=n_estimators,
                 max_depth=max_depth,
@@ -357,7 +357,7 @@ class CatBoostModel(BaseModel):
     ):
         super().__init__('CatBoost')
         try:
-            from catboost import CatBoostClassifier  # noqa: PLC0415
+            from catboost import CatBoostClassifier
             self.model = CatBoostClassifier(
                 iterations=iterations,
                 depth=depth,

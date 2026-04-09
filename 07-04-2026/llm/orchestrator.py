@@ -84,7 +84,7 @@ class _OpenAIAdapter:
     """Wraps the openai Python SDK."""
 
     def __init__(self, cfg: LLMConfig):
-        import openai  # noqa: PLC0415
+        import openai
         key = _load_api_key("OPENAI_API_KEY", cfg.api_key)
         kwargs: Dict[str, Any] = {"api_key": key, "timeout": cfg.timeout}
         if cfg.base_url:
@@ -109,7 +109,7 @@ class _AnthropicAdapter:
     """Wraps the anthropic Python SDK."""
 
     def __init__(self, cfg: LLMConfig):
-        import anthropic  # noqa: PLC0415
+        import anthropic
         key = _load_api_key("ANTHROPIC_API_KEY", cfg.api_key)
         self._client = anthropic.Anthropic(api_key=key)
         self._cfg = cfg
