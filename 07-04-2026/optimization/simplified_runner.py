@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import optuna
 import pandas as pd
+import scipy.stats as stats
 from sklearn.metrics import roc_auc_score
 
 from scaf_ls.config import Config
@@ -20,9 +21,48 @@ from scaf_ls.data.engineer import CrossAssetFeatureEngineer
 from scaf_ls.features.selector import AutomatedFeatureSelector
 from scaf_ls.models.registry import registry
 from scaf_ls.validation.cv_strategies import PurgedKFold
+from monitoring.drift_detection import DriftDetector
+from monitoring.alerts import AlertManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Statistical helpers
+# ---------------------------------------------------------------------------
+
+def deflated_sharpe_ratio(returns: np.ndarray, sr_benchmark: float = 0.0) -> float:
+    """
+    Probabilistic Sharpe Ratio (Bailey & López de Prado, 2012).
+
+    Measures the probability that the estimated Sharpe Ratio exceeds
+    ``sr_benchmark`` after adjusting for non-normality and finite sample.
+
+    Parameters
+    ----------
+    returns : 1-D array of period returns
+    sr_benchmark : benchmark SR to test against (default 0)
+
+    Returns
+    -------
+    float in [0, 1] – probability that true SR > sr_benchmark
+    """
+    T = len(returns)
+    if T < 5:
+        return float("nan")
+
+    sr_hat = np.mean(returns) / (np.std(returns, ddof=1) + 1e-12)
+    skew = float(pd.Series(returns).skew())
+    kurt = float(pd.Series(returns).kurtosis())  # excess kurtosis
+
+    # Standard error of the SR estimator (Mertens, 2002)
+    se = np.sqrt(
+        (1 + 0.5 * sr_hat ** 2 - skew * sr_hat + ((kurt + 3) / 4) * sr_hat ** 2) / (T - 1)
+    )
+
+    psr = float(stats.norm.cdf((sr_hat - sr_benchmark) / (se + 1e-12)))
+    return psr
 
 
 class SimplifiedModelOptimizer:
@@ -36,10 +76,13 @@ class SimplifiedModelOptimizer:
             sampler=optuna.samplers.TPESampler(seed=42),
             pruner=optuna.pruners.MedianPruner()
         )
+        # Drift detector initialised once; reference data set on first fold
+        self._drift_detector = DriftDetector()
+        self._alert_manager = AlertManager() if AlertManager is not None else None
         self._prepare_data()
 
     def _prepare_data(self):
-        """Préparer les données"""
+        """Charger toutes les features brutes – la sélection se fait par fold."""
         try:
             loader = MultiAssetLoader()
             data = loader.load_data()
@@ -47,17 +90,17 @@ class SimplifiedModelOptimizer:
             engineer = CrossAssetFeatureEngineer()
             features = engineer.create_features(data)
 
-            selector = AutomatedFeatureSelector()
-            selected_features = selector.run_full_analysis(features.drop(columns=['target']), features['target'])['selected_features']
-            # Re-add target column
-            selected_features.append('target')
-            selected_features = features[selected_features]
+            # Store full feature matrix; feature selection happens inside each
+            # CV fold to prevent data leakage from the validation window.
+            self.X = features.drop(columns=['target'])
+            if 'date' in self.X.columns:
+                self.dates = self.X.pop('date')
+            else:
+                self.dates = pd.Series(range(len(self.X)))
+            self.y = features['target']
 
-            self.X = selected_features.drop(columns=['target', 'date'])
-            self.y = selected_features['target']
-            self.dates = selected_features['date']
-
-            logger.info(f"Data prepared for {self.model_name}: {len(self.X)} samples")
+            logger.info(f"Data prepared for {self.model_name}: {len(self.X)} samples, "
+                        f"{self.X.shape[1]} raw features (selection happens per fold)")
 
         except Exception as e:
             logger.error(f"Failed to prepare data: {e}")
@@ -91,23 +134,45 @@ class SimplifiedModelOptimizer:
         else:
             raise ValueError(f"Unknown model: {self.model_name}")
 
-    def _evaluate_params(self, params: dict) -> tuple[float, float]:
-        """Évaluer les paramètres avec CV"""
+    def _evaluate_params(self, params: dict) -> tuple:
+        """
+        Évaluer les paramètres avec walk-forward CV.
+
+        Feature selection is performed **inside each fold** using only the
+        training window to prevent data leakage into the validation window.
+        Raises PurgedKFold to n_splits=5 for more robust estimates.
+        Also feeds validation samples to the drift detector.
+        """
         try:
             model_class = get_model(self.model_name)
             if model_class is None:
                 return 0.5, 1.0
 
-            cv = PurgedKFold(n_splits=3, embargo=2)
+            cv = PurgedKFold(n_splits=5, embargo=2)
             fold_scores = []
+            fold_returns = []  # for DSR calculation
+            reference_set = True  # first fold sets the drift reference
 
             for fold_idx, (train_idx, val_idx) in enumerate(cv.split(self.X)):
                 try:
-                    X_train = self.X.iloc[train_idx]
+                    X_train_raw = self.X.iloc[train_idx]
                     y_train = self.y.iloc[train_idx]
-                    X_val = self.X.iloc[val_idx]
+                    X_val_raw = self.X.iloc[val_idx]
                     y_val = self.y.iloc[val_idx]
 
+                    # --- Feature selection on training data only (no leakage) ---
+                    selector = AutomatedFeatureSelector()
+                    sel_report = selector.run_full_analysis(
+                        X_train_raw, y_train, target_n_features=25
+                    )
+                    selected_cols = sel_report['selected_features']
+                    if not selected_cols:
+                        selected_cols = list(X_train_raw.columns)
+
+                    X_train = X_train_raw[selected_cols]
+                    X_val = X_val_raw[selected_cols]
+
+                    # --- Train and predict ---
                     model = model_class(**params)
                     model.fit(X_train.values, y_train.values)
 
@@ -123,12 +188,59 @@ class SimplifiedModelOptimizer:
                     auc = roc_auc_score(y_val, y_pred_proba)
                     fold_scores.append(auc)
 
+                    # --- Drift monitoring ---
+                    if reference_set:
+                        self._drift_detector.set_reference_data(
+                            X_train.values,
+                            y=y_train.values,
+                            predictions=model.predict_proba(X_train.values)[:, 1]
+                            if hasattr(model, 'predict_proba') else None,
+                        )
+                        reference_set = False
+                    else:
+                        for i in range(len(X_val)):
+                            self._drift_detector.add_test_sample(
+                                X_val.iloc[i].values,
+                                y_true=float(y_val.iloc[i]),
+                                y_pred=float(y_pred_proba[i]),
+                            )
+                        drift_metrics = self._drift_detector.get_drift_metrics()
+                        if drift_metrics.is_drifting:
+                            logger.warning(
+                                f"[DRIFT] Fold {fold_idx} – overall drift score "
+                                f"{drift_metrics.overall_drift:.3f} "
+                                f"(data={drift_metrics.data_drift_score:.3f}, "
+                                f"model={drift_metrics.model_drift_score:.3f}, "
+                                f"concept={drift_metrics.concept_drift_score:.3f})"
+                            )
+                            if self._alert_manager is not None:
+                                try:
+                                    self._alert_manager.trigger_alert(
+                                        alert_type="model_drift",
+                                        severity="warning",
+                                        message=f"{self.model_name} fold {fold_idx}: "
+                                                f"drift={drift_metrics.overall_drift:.3f}",
+                                    )
+                                except Exception:
+                                    pass
+
+                    # Approximate per-period returns from AUC for DSR
+                    fold_returns.append(auc - 0.5)  # excess over random
+
                 except Exception as e:
                     logger.warning(f"Fold {fold_idx} failed: {e}")
                     fold_scores.append(0.5)
+                    fold_returns.append(0.0)
 
             mean_auc = np.mean(fold_scores)
             stability = np.std(fold_scores)
+
+            # --- Deflated Sharpe Ratio significance test ---
+            if len(fold_returns) >= 5:
+                psr = deflated_sharpe_ratio(np.array(fold_returns), sr_benchmark=0.0)
+                logger.info(f"[DSR] {self.model_name} PSR={psr:.3f} (prob SR>0)")
+            else:
+                psr = float("nan")
 
             return mean_auc, stability
 

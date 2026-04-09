@@ -102,11 +102,11 @@ class LightGBMCustomLoss:
             # Standard cross-entropy
             ce_loss = -y_true * np.log(p + 1e-8) - (1 - y_true) * np.log(1 - p + 1e-8)
 
-            # Penalize very high confidence predictions (potential for large losses)
-            extreme_confidence_penalty = max_drawdown_penalty * np.where(
-                p > 0.8, (p - 0.8) * 5, 0
-            ) * np.where(
-                p < 0.2, (0.2 - p) * 5, 0
+            # Penalize predictions with extreme confidence in either direction
+            # Use OR logic (addition): penalise p > 0.8 OR p < 0.2 independently
+            extreme_confidence_penalty = max_drawdown_penalty * (
+                np.where(p > 0.8, (p - 0.8) * 5, 0)
+                + np.where(p < 0.2, (0.2 - p) * 5, 0)
             )
 
             total_loss = ce_loss + extreme_confidence_penalty
@@ -181,24 +181,19 @@ class LightGBMCustomObjective:
         def objective(y_pred: np.ndarray, y_true: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
             y_true = y_true.get_label()
 
-            # Sort predictions and true labels
-            sorted_indices = np.argsort(y_pred)
-            y_pred_sorted = y_pred[sorted_indices]
-            y_true_sorted = y_true[sorted_indices]
+            # Vectorised rank-based loss (O(n log n) instead of O(n²)).
+            # For each sample i, count the number of concordant violations:
+            #   positive i ranked below a negative j  → push i up, j down
+            # Approximation: gradient ∝ (rank of y_pred) - (rank of y_true)
+            n = len(y_pred)
+            pred_ranks = np.argsort(np.argsort(y_pred)).astype(float)  # 0-indexed ranks
+            true_ranks = np.argsort(np.argsort(y_true)).astype(float)
 
-            # Rank-based loss: penalize when positive examples are ranked below negative ones
-            grad = np.zeros_like(y_pred)
-            hess = np.zeros_like(y_pred)
+            # Gradient: penalise samples whose pred rank lags behind true rank
+            grad = (pred_ranks - true_ranks) / (n - 1 + 1e-6)
 
-            for i in range(len(y_pred)):
-                for j in range(i + 1, len(y_pred)):
-                    if y_true_sorted[i] > y_true_sorted[j]:  # Should be ranked higher
-                        if y_pred_sorted[i] < y_pred_sorted[j]:  # But is ranked lower
-                            # Penalize this pair
-                            grad[sorted_indices[i]] += 1
-                            grad[sorted_indices[j]] -= 1
-                            hess[sorted_indices[i]] += 1
-                            hess[sorted_indices[j]] += 1
+            # Hessian: uniform positive curvature to ensure numerical stability
+            hess = np.ones_like(y_pred) / n
 
             return grad, hess
 

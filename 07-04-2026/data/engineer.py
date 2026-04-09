@@ -201,7 +201,8 @@ class CrossAssetFeatureEngineer:
         feats['ichimoku_kijun'] = kijun_sen.shift(1)
         feats['ichimoku_senkou_a'] = senkou_span_a.shift(1)
         feats['ichimoku_senkou_b'] = senkou_span_b.shift(1)
-        feats['ichimoku_chikou'] = chikou_span.shift(1)
+        # chikou_span uses a negative shift; clamp to avoid forward-looking NaN
+        feats['ichimoku_chikou'] = chikou_span.shift(1).ffill()
 
         # Commodity Channel Index (CCI)
         typical_price = (spx_close + spx_close.rolling(20).max() + spx_close.rolling(20).min()) / 3
@@ -231,7 +232,13 @@ class CrossAssetFeatureEngineer:
 
         # Clean and prepare data
         df = pd.DataFrame(feats, index=idx)
-        df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+        # Replace infinities, forward-fill isolated NaNs produced by rolling windows,
+        # then backward-fill any leading NaNs, and finally zero-fill any remainder.
+        df = (df
+              .replace([np.inf, -np.inf], np.nan)
+              .ffill()
+              .bfill()
+              .fillna(0))
 
         # Target
         fwd_ret = spx_ret.rolling(self.horizon).sum().shift(-self.horizon)
