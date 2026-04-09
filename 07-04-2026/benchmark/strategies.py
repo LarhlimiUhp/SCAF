@@ -38,11 +38,14 @@ class BenchmarkStrategies:
         eq_ret, bd_ret = eq_ret.align(bd_ret, join='inner', fill_value=0)
 
         port_returns = pd.Series(index=eq_ret.index, dtype=float)
-        w_eq, w_bd = 0.60, 0.40
+        w_eq, w_bd = 0.60, 0.40  # nominal target weights
 
         for i, dt in enumerate(eq_ret.index):
             if i > 0 and i % rebalance_freq == 0:
-                # Reset weights (drift since last rebalance is small for daily returns)
+                # Rebalance: reset back to nominal target weights.
+                # Note: this simplified version resets weights to target
+                # without computing actual portfolio drift; for production use,
+                # track running portfolio value and compute weight drift.
                 w_eq, w_bd = 0.60, 0.40
             port_returns[dt] = w_eq * eq_ret[dt] + w_bd * bd_ret[dt]
 

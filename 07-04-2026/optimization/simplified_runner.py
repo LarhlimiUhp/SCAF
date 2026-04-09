@@ -68,9 +68,11 @@ def deflated_sharpe_ratio(returns: np.ndarray, sr_benchmark: float = 0.0) -> flo
 class SimplifiedModelOptimizer:
     """Optimiseur simplifié pour un modèle spécifique"""
 
-    def __init__(self, model_name: str, max_trials: int = 50):
+    def __init__(self, model_name: str, max_trials: int = 50,
+                 target_n_features: int = 25):
         self.model_name = model_name
         self.max_trials = max_trials
+        self.target_n_features = target_n_features
         self.study = optuna.create_study(
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=42),
@@ -78,7 +80,10 @@ class SimplifiedModelOptimizer:
         )
         # Drift detector initialised once; reference data set on first fold
         self._drift_detector = DriftDetector()
-        self._alert_manager = AlertManager() if AlertManager is not None else None
+        try:
+            self._alert_manager = AlertManager()
+        except Exception:
+            self._alert_manager = None
         self._prepare_data()
 
     def _prepare_data(self):
@@ -134,14 +139,19 @@ class SimplifiedModelOptimizer:
         else:
             raise ValueError(f"Unknown model: {self.model_name}")
 
-    def _evaluate_params(self, params: dict) -> tuple:
+    def _evaluate_params(self, params: dict) -> tuple[float, float]:
         """
         Évaluer les paramètres avec walk-forward CV.
 
         Feature selection is performed **inside each fold** using only the
         training window to prevent data leakage into the validation window.
-        Raises PurgedKFold to n_splits=5 for more robust estimates.
-        Also feeds validation samples to the drift detector.
+        Uses PurgedKFold with n_splits=5 for more robust estimates.
+        Also feeds validation samples to the drift detector and logs
+        the Probabilistic Sharpe Ratio (PSR/DSR) per trial.
+
+        Note: ``fold_returns`` uses ``auc - 0.5`` as a rough signed excess
+        over random – this is a coarse proxy that enables relative comparison
+        across trials but does not represent actual portfolio returns.
         """
         try:
             model_class = get_model(self.model_name)
@@ -150,7 +160,7 @@ class SimplifiedModelOptimizer:
 
             cv = PurgedKFold(n_splits=5, embargo=2)
             fold_scores = []
-            fold_returns = []  # for DSR calculation
+            fold_returns = []  # for DSR calculation (auc−0.5 proxy)
             reference_set = True  # first fold sets the drift reference
 
             for fold_idx, (train_idx, val_idx) in enumerate(cv.split(self.X)):
@@ -163,7 +173,8 @@ class SimplifiedModelOptimizer:
                     # --- Feature selection on training data only (no leakage) ---
                     selector = AutomatedFeatureSelector()
                     sel_report = selector.run_full_analysis(
-                        X_train_raw, y_train, target_n_features=25
+                        X_train_raw, y_train,
+                        target_n_features=self.target_n_features,
                     )
                     selected_cols = sel_report['selected_features']
                     if not selected_cols:

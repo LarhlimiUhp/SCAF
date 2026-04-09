@@ -201,8 +201,9 @@ class CrossAssetFeatureEngineer:
         feats['ichimoku_kijun'] = kijun_sen.shift(1)
         feats['ichimoku_senkou_a'] = senkou_span_a.shift(1)
         feats['ichimoku_senkou_b'] = senkou_span_b.shift(1)
-        # chikou_span uses a negative shift; clamp to avoid forward-looking NaN
-        feats['ichimoku_chikou'] = chikou_span.shift(1).ffill()
+        # chikou_span uses a negative shift; limit forward fill to avoid
+        # propagating stale values for more than 5 bars.
+        feats['ichimoku_chikou'] = chikou_span.shift(1).ffill(limit=5)
 
         # Commodity Channel Index (CCI)
         typical_price = (spx_close + spx_close.rolling(20).max() + spx_close.rolling(20).min()) / 3
