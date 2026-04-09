@@ -61,8 +61,8 @@ class LightGBMModel(BaseModel):
     - No verbose prints (walk-forward ~10x faster)
     """
 
-    def __init__(self, n_estimators=400, max_depth=5, learning_rate=0.05,
-                 num_leaves=31, lambda_l1=0.5, lambda_l2=0.5,
+    def __init__(self, n_estimators=400, max_depth=-1, learning_rate=0.05,
+                 num_leaves=63, lambda_l1=0.5, lambda_l2=0.5,
                  boosting_type='gbdt'):
         super().__init__('LightGBM')
         try:
@@ -87,7 +87,7 @@ class LightGBMModel(BaseModel):
                 verbosity=-1,
                 n_jobs=-1,
             )
-            self.model = CalibratedClassifierCV(self._raw, method='sigmoid', cv=3)
+            self.model = CalibratedClassifierCV(self._raw, method='isotonic', cv=3)
         except ImportError:
             self._raw = None
             self.model = None

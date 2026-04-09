@@ -45,7 +45,7 @@ class LSTMClassModel(BaseModel):
         X_seq = np.stack([Xs[i:i + self.seq_len] for i in range(n)])
         y_seq = y[self.seq_len:].astype(np.float32)
         self.net = _BiLSTMNet(X.shape[1], self.hidden).to(self.device)
-        opt = torch.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=1e-3)  # Augmenté de 1e-4 à 1e-3
+        opt = torch.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=1e-4)
         crit = nn.BCELoss()
         self.net.train()
         for _ in range(self.epochs):

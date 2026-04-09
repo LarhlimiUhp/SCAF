@@ -124,8 +124,10 @@ class DriftDetector:
         """
         Détecter la dérive du modèle (changement de performance)
         """
-        if (self.reference_predictions is None or 
-            len(self.test_predictions_history) == 0):
+        if (self.reference_predictions is None or
+            self.reference_targets is None or
+            len(self.test_predictions_history) == 0 or
+            len(self.test_targets_history) == 0):
             return 0.0
         
         # Comparer les erreurs de prédiction entre les ensembles

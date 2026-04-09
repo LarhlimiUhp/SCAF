@@ -89,7 +89,7 @@ class SimplifiedModelOptimizer:
     def _prepare_data(self):
         """Charger toutes les features brutes – la sélection se fait par fold."""
         try:
-            loader = MultiAssetLoader()
+            loader = MultiAssetLoader(Config)
             data = loader.load_data()
 
             engineer = CrossAssetFeatureEngineer()
@@ -154,11 +154,11 @@ class SimplifiedModelOptimizer:
         across trials but does not represent actual portfolio returns.
         """
         try:
-            model_class = get_model(self.model_name)
+            model_class = registry.all().get(self.model_name)
             if model_class is None:
                 return 0.5, 1.0
 
-            cv = PurgedKFold(n_splits=5, embargo=2)
+            cv = PurgedKFold(n_splits=5, embargo=5)
             fold_scores = []
             fold_returns = []  # for DSR calculation (auc−0.5 proxy)
             reference_set = True  # first fold sets the drift reference
@@ -423,8 +423,8 @@ def generate_final_report(results: dict):
 
     if successful_results:
         print(f"Models optimized: {len(successful_results)}")
-        print(".4f")
-        print(".4f")
+        print(f"Average AUC: {avg_auc:.4f}")
+        print(f"Average Stability: {avg_stability:.4f}")
         print(f"AUC Target: {'✅ ACHIEVED' if avg_auc > 0.6 else '❌ NOT MET'}")
         print(f"Stability Target: {'✅ ACHIEVED' if avg_stability < 0.2 else '❌ NOT MET'}")
     else:

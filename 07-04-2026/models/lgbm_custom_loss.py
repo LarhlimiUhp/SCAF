@@ -40,12 +40,20 @@ class LightGBMCustomLoss:
             ce_loss = -alpha * y_true * np.log(p + 1e-8) - (1 - alpha) * (1 - y_true) * np.log(1 - p + 1e-8)
             loss = focal_weight * ce_loss
 
-            # Gradient
-            p_clipped = np.clip(p, 1e-8, 1 - 1e-8)
-            grad = p - y_true
+            # Correct focal gradient via chain rule:
+            #   dFL/ds = alpha_t * (1-pt)^gamma * [gamma*pt*log(pt) - (1-pt)] * (2y-1)
+            alpha_t = np.where(y_true == 1, alpha, 1 - alpha)
+            pt_clipped = np.clip(pt, 1e-8, 1 - 1e-8)
+            grad = alpha_t * (1 - pt_clipped) ** gamma * (
+                gamma * pt_clipped * np.log(pt_clipped) - (1 - pt_clipped)
+            ) * (2 * y_true - 1)
 
-            # Second derivative (Hessian)
-            hess = p_clipped * (1 - p_clipped)
+            # Hessian: focal-weighted BCE curvature (positive definite)
+            p_clipped = np.clip(p, 1e-8, 1 - 1e-8)
+            hess = np.maximum(
+                alpha_t * (1 - pt_clipped) ** gamma * p_clipped * (1 - p_clipped),
+                1e-6,
+            )
 
             return grad, hess
 
@@ -70,15 +78,16 @@ class LightGBMCustomLoss:
             # Standard binary cross-entropy
             ce_loss = -y_true * np.log(p + 1e-8) - (1 - y_true) * np.log(1 - p + 1e-8)
 
-            # Add penalty based on prediction confidence distribution
-            # Penalize overconfident predictions that might lead to poor Sharpe
-            confidence_penalty = penalty_weight * np.abs(p - 0.5) * (1 - np.abs(p - 0.5))
+            # Add penalty based on prediction confidence distribution.
+            # Higher target_sharpe allows more concentrated positions (less penalty).
+            sharpe_scale = 1.0 / (1.0 + target_sharpe)
+            confidence_penalty = penalty_weight * sharpe_scale * np.abs(p - 0.5) * (1 - np.abs(p - 0.5))
 
             total_loss = ce_loss + confidence_penalty
 
             # Gradients
-            grad = p - y_true + penalty_weight * np.sign(p - 0.5) * (1 - 2 * np.abs(p - 0.5))
-            hess = p * (1 - p) + penalty_weight * (1 - 2 * np.abs(p - 0.5))**2
+            grad = p - y_true + penalty_weight * sharpe_scale * np.sign(p - 0.5) * (1 - 2 * np.abs(p - 0.5))
+            hess = p * (1 - p) + penalty_weight * sharpe_scale * (1 - 2 * np.abs(p - 0.5))**2
 
             return grad, hess
 
