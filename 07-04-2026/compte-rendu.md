@@ -1811,11 +1811,12 @@ ConformalEnsemble : enveloppe n’importe quelle liste de avec calibration CP + 
 XGBoost, , , , , , , ExtraTreesAdaBoostHistGBTMLPRidgeClassBaggingLRCatBoost
 
 5. — Pipeline E2Epipeline/experiment.py
-Téléchargement réel via yfinance (S&P 500 + 12 actifs croisés)
-Walk-forward avec splits purgés
-Calibration CP par fold, Q-Learning mis à jour après chaque fold
-LLM consulté toutes les 5 barres (contrôle des coûts)
-300 sous-agents de risque intégrés
-Indices de référence : achat et conservation, momentum, parité de risque
-Métriques : Sharpe, TCAC, dépression maximale, AUC, précision, couverture CP
-CLI : python pipeline/experiment.py --ticker ^GSPC --start 2015-01-01
+   
+### Téléchargement réel via yfinance (S&P 500 + 12 actifs croisés)
+### Walk-forward avec splits purgés
+### Calibration CP par fold, Q-Learning mis à jour après chaque fold
+### LLM consulté toutes les 5 barres (contrôle des coûts)
+### 300 sous-agents de risque intégrés
+### Indices de référence : achat et conservation, momentum, parité de risque
+### Métriques : Sharpe, TCAC, dépression maximale, AUC, précision, couverture CP
+### CLI : python pipeline/experiment.py --ticker ^GSPC --start 2015-01-01
