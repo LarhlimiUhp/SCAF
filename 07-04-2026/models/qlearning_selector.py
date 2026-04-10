@@ -111,7 +111,7 @@ class QLearningSelector:
         model_names: List[str],
         alpha: float = 0.1,
         gamma: float = 0.9,
-        epsilon_start: float = 1.0,
+        epsilon_start: float = 0.3,
         epsilon_min: float = 0.05,
         epsilon_decay: float = 0.995,
         lambda_drawdown: float = 0.5,
@@ -134,8 +134,15 @@ class QLearningSelector:
         )
         n_actions = len(self._actions)
 
-        # Q-table: shape (N_STATES, n_actions), initialised optimistically
+        # Q-table: shape (N_STATES, n_actions), initialised to zero
         self._q: np.ndarray = np.zeros((N_STATES, n_actions), dtype=np.float64)
+
+        # Defensive priors: penalise large model subsets during crisis states
+        _crisis_start = _REGIME_IDX["crisis"] * len(PERF_BUCKETS)
+        for _s in range(_crisis_start, _crisis_start + len(PERF_BUCKETS)):
+            for _a_idx, _action in enumerate(self._actions):
+                if len(_action) > 2:
+                    self._q[_s, _a_idx] = -1.0
 
         # Experience replay buffer: (state, action_idx, reward, next_state)
         self._replay: Deque[Tuple[int, int, float, int]] = deque(

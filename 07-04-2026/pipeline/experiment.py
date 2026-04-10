@@ -147,7 +147,6 @@ class ExperimentPipeline:
 
     def __init__(self, config: Optional[ExperimentConfig] = None):
         self.cfg = config or ExperimentConfig()
-        self._scaler = StandardScaler()
 
         # Lazy-initialised components
         self._ql_selector = None
@@ -171,9 +170,9 @@ class ExperimentPipeline:
         if X_raw is None:
             return {"error": "Data loading failed"}
 
-        # ── Step 2: Scale ────────────────────────────────────────────── #
-        logger.info("[2/7] Scaling features …")
-        X = self._scaler.fit_transform(X_raw.values.astype(np.float32))
+        # ── Step 2: Convert features (per-fold scaling applied in _run_fold) ── #
+        logger.info("[2/7] Converting features …")
+        X = X_raw.values.astype(np.float32)
         y_arr = y.values.astype(int)
 
         # ── Step 3: Models ──────────────────────────────────────────── #
@@ -377,6 +376,12 @@ class ExperimentPipeline:
         X_fit, y_fit = X_train[:-n_cal], y_train[:-n_cal]
         X_cal, y_cal = X_train[-n_cal:], y_train[-n_cal:]
 
+        # Per-fold feature scaling: fit only on X_fit to avoid data leakage
+        _fold_scaler = StandardScaler()
+        X_fit = _fold_scaler.fit_transform(X_fit)
+        X_cal = _fold_scaler.transform(X_cal)
+        X_val = _fold_scaler.transform(X_val)
+
         # ── Train models ──────────────────────────────────────────────── #
         trained: Dict[str, Any] = {}
         model_auc: Dict[str, float] = {}
@@ -410,17 +415,25 @@ class ExperimentPipeline:
                 "Fold %d conformal q_hat=%.4f", fold_idx, ensemble.q_hat or float("nan")
             )
 
+        # ── Regime detection (used for model selection and signal scaling) ── #
+        regime_label = self._infer_regime(X_val, prices_val)
+        recent_sharpe = _rolling_sharpe(np.diff(np.log(prices_val.values + 1e-12)))
+
         # ── Q-learning model selection ────────────────────────────────── #
         active_model_names = list(trained.keys())
         if self._ql_selector is not None and active_model_names:
-            regime_label = self._infer_regime(X_val, prices_val)
-            recent_sharpe = _rolling_sharpe(
-                np.diff(np.log(prices_val.values + 1e-12))
-            )
             ql_selection = self._ql_selector.select(regime_label, recent_sharpe)
             active_model_names = [m for m in ql_selection if m in trained]
             if not active_model_names:
                 active_model_names = list(trained.keys())
+
+        # Regime-aware base position scalar: reduce aggressiveness in adverse regimes
+        if regime_label == "crisis":
+            regime_pos_scalar = 0.25
+        elif regime_label == "bear":
+            regime_pos_scalar = 0.60
+        else:
+            regime_pos_scalar = self.cfg.position_scalar
 
         # ── Walk-forward signal generation ───────────────────────────── #
         portfolio_returns = []
@@ -434,11 +447,12 @@ class ExperimentPipeline:
                 p, _ = trained[name].predict_proba_one(x_row)
                 probs.append(p)
             prob = float(np.mean(probs)) if probs else 0.5
-            signal = 1.0 if prob > 0.5 else -1.0
+            # Gradual signal in [-1, 1]; position scaling applied via pos_scalar
+            signal = (prob - 0.5) * 2.0
             signals.append(signal)
 
-            # Position scalar from LLM risk override
-            pos_scalar = self.cfg.position_scalar
+            # Position scalar: regime-adjusted baseline, optionally overridden by LLM
+            pos_scalar = regime_pos_scalar
             if self._llm is not None and i % 20 == 0:
                 try:
                     vol_5d = float(np.std(
@@ -481,15 +495,22 @@ class ExperimentPipeline:
 
         # Update Q-learning with fold outcome
         if self._ql_selector is not None and len(ret_arr) > 0:
+            n_third = max(1, len(X_val) // 3)
+            next_regime_label = self._infer_regime(
+                X_val[-n_third:], prices_val.iloc[-n_third:]
+            )
+            next_sharpe = _rolling_sharpe(
+                ret_arr[-n_third:] if len(ret_arr) >= n_third else ret_arr
+            )
             self._ql_selector.observe(
-                state_regime=self._infer_regime(X_val, prices_val),
+                state_regime=regime_label,
                 state_sharpe=_rolling_sharpe(ret_arr),
                 action_models=active_model_names,
                 ret=float(np.mean(ret_arr)),
                 vol=float(np.std(ret_arr)) + 1e-12,
                 drawdown=abs(fold_dd),
-                next_regime=self._infer_regime(X_val, prices_val),
-                next_sharpe=_rolling_sharpe(ret_arr),
+                next_regime=next_regime_label,
+                next_sharpe=next_sharpe,
             )
 
         return {
@@ -524,9 +545,11 @@ class ExperimentPipeline:
                 return result.get("regime", "sideways")
             except Exception:
                 pass
-        # Rule-based fallback
-        if len(X_val) > 5:
-            vol_est = float(np.std(np.diff(np.log(prices_val.values + 1e-12))))
+        # Rule-based fallback — use only the last 20 days for current-regime detection
+        recent_n = min(20, len(prices_val))
+        if recent_n > 2:
+            recent_prices = prices_val.values[-recent_n:]
+            vol_est = float(np.std(np.diff(np.log(recent_prices + 1e-12))))
         else:
             vol_est = 0.01
         return _detect_regime(vol_est)
