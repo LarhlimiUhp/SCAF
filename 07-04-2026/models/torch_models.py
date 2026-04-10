@@ -1,41 +1,52 @@
 import numpy as np
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 from sklearn.preprocessing import StandardScaler
 
 from .base import BaseModel
 from .registry import register_model
 
 
-class _BiLSTMNet(nn.Module):
-    def __init__(self, input_dim, hidden=24, n_layers=2, dropout=0.2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden, n_layers, batch_first=True,
-                            dropout=dropout if n_layers > 1 else 0.0,
-                            bidirectional=True)
-        self.head = nn.Sequential(
-            nn.Linear(hidden * 2, 12), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(12, 1), nn.Sigmoid())
+if _TORCH_AVAILABLE:
+    class _BiLSTMNet(nn.Module):
+        def __init__(self, input_dim, hidden=24, n_layers=2, dropout=0.2):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden, n_layers, batch_first=True,
+                                dropout=dropout if n_layers > 1 else 0.0,
+                                bidirectional=True)
+            self.head = nn.Sequential(
+                nn.Linear(hidden * 2, 12), nn.ReLU(), nn.Dropout(0.1),
+                nn.Linear(12, 1), nn.Sigmoid())
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.head(out[:, -1, :]).squeeze(-1)
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            return self.head(out[:, -1, :]).squeeze(-1)
+else:
+    _BiLSTMNet = None  # type: ignore[assignment,misc]
 
 
 @register_model('BiLSTM')
 class LSTMClassModel(BaseModel):
     def __init__(self, seq_len=10, hidden=16, epochs=5, lr=5e-4, device='cpu'):
         super().__init__('BiLSTM')
-        self.seq_len = seq_len  # Réduit de 20 à 10
-        self.hidden = hidden    # Réduit de 24 à 16
-        self.epochs = epochs    # Réduit de 10 à 5
-        self.lr = lr            # Réduit de 1e-3 à 5e-4
-        self.device = torch.device(device)
+        self.seq_len = seq_len
+        self.hidden = hidden
+        self.epochs = epochs
+        self.lr = lr
+        self.device = torch.device(device) if _TORCH_AVAILABLE else None
         self.net = None
         self.sc = StandardScaler()
         self._buffer = []
 
     def fit(self, X, y):
+        if not _TORCH_AVAILABLE or _BiLSTMNet is None:
+            return
         if len(X) <= self.seq_len + 10 or len(np.unique(y)) < 2:
             return
         Xs = self.sc.fit_transform(X).astype(np.float32)
@@ -115,31 +126,34 @@ class TabNetModel(BaseModel):
             return 0.5, 0.25
 
 
-class _GraphConvNet(nn.Module):
-    def __init__(self, input_dim, hidden=32, n_layers=2):
-        super().__init__()
-        try:
-            from torch_geometric.nn import GCNConv, global_mean_pool
-        except ImportError:
-            raise ImportError('torch_geometric is required for GraphNNModel')
+if _TORCH_AVAILABLE:
+    class _GraphConvNet(nn.Module):
+        def __init__(self, input_dim, hidden=32, n_layers=2):
+            super().__init__()
+            try:
+                from torch_geometric.nn import GCNConv, global_mean_pool
+            except ImportError:
+                raise ImportError('torch_geometric is required for GraphNNModel')
 
-        self.convs = nn.ModuleList()
-        for i in range(n_layers):
-            self.convs.append(
-                GCNConv(input_dim if i == 0 else hidden, hidden)
-            )
-        self.head = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1), nn.Sigmoid())
-        self.global_mean_pool = global_mean_pool
+            self.convs = nn.ModuleList()
+            for i in range(n_layers):
+                self.convs.append(
+                    GCNConv(input_dim if i == 0 else hidden, hidden)
+                )
+            self.head = nn.Sequential(
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1), nn.Sigmoid())
+            self.global_mean_pool = global_mean_pool
 
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        for conv in self.convs:
-            x = conv(x, edge_index)
-            x = torch.relu(x)
-        x = self.global_mean_pool(x, batch)
-        return self.head(x).squeeze(-1)
+        def forward(self, data):
+            x, edge_index, batch = data.x, data.edge_index, data.batch
+            for conv in self.convs:
+                x = conv(x, edge_index)
+                x = torch.relu(x)
+            x = self.global_mean_pool(x, batch)
+            return self.head(x).squeeze(-1)
+else:
+    _GraphConvNet = None  # type: ignore[assignment,misc]
 
 
 @register_model('GraphNN')
@@ -149,17 +163,20 @@ class GraphNNModel(BaseModel):
         self.epochs = epochs
         self.lr = lr
         self.hidden = hidden
-        self.device = torch.device(device)
+        self.device = torch.device(device) if _TORCH_AVAILABLE else None
         self.net = None
         self.sc = StandardScaler()
         self.edge_index = None
-        self._available = True
-        try:
-            import torch_geometric
-        except ImportError:
-            self._available = False
+        self._available = _TORCH_AVAILABLE
+        if self._available:
+            try:
+                import torch_geometric  # noqa: F401
+            except ImportError:
+                self._available = False
 
     def _build_edge_index(self, num_nodes):
+        if not _TORCH_AVAILABLE:
+            return None
         row = torch.arange(num_nodes).repeat_interleave(num_nodes)
         col = torch.arange(num_nodes).repeat(num_nodes)
         return torch.stack([row, col], dim=0)
