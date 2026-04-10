@@ -1,8 +1,10 @@
-Comprendre la structure et l’organisation de la base de code
+## Comprendre la structure et l’organisation de la base de code
+
 Chargement
 Toi
 créé la session
 il y a 11 heures
+
 ·
 Logo anthropique
 Claude Sonnet 4.6 ·
