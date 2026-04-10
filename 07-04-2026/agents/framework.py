@@ -312,10 +312,6 @@ class AgentOrchestrator:
             self.agents.append(agent)
             self.agent_weights[agent.agent_id] = 1.0
 
-            agent = VolatilityControlAgent(f'vol_ctrl_{i}', config)
-            self.agents.append(agent)
-            self.agent_weights[agent.agent_id] = 1.0  # Standard weight for vol control
-
         # Drawdown Management Agents (100) - Higher weight for risk control
         dd_configs = [
             {'max_drawdown': 0.12, 'trailing_stop': 0.03, 'recovery_threshold': 0.08},  # Tighter limits

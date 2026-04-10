@@ -102,19 +102,19 @@ class LightGBMCustomLoss:
             # Standard cross-entropy
             ce_loss = -y_true * np.log(p + 1e-8) - (1 - y_true) * np.log(1 - p + 1e-8)
 
-            # Penalize very high confidence predictions (potential for large losses)
-            extreme_confidence_penalty = max_drawdown_penalty * np.where(
-                p > 0.8, (p - 0.8) * 5, 0
-            ) * np.where(
-                p < 0.2, (0.2 - p) * 5, 0
+            # Penalize very high or very low confidence predictions (potential for large losses)
+            # Uses additive penalty: high confidence (p>0.8) OR low confidence (p<0.2)
+            extreme_confidence_penalty = max_drawdown_penalty * (
+                np.where(p > 0.8, (p - 0.8) * 5, 0.0) +
+                np.where(p < 0.2, (0.2 - p) * 5, 0.0)
             )
 
             total_loss = ce_loss + extreme_confidence_penalty
 
             # Gradients
             grad = p - y_true
-            grad += max_drawdown_penalty * np.where(
-                p > 0.8, 5, np.where(p < 0.2, -5, 0)
+            grad += max_drawdown_penalty * (
+                np.where(p > 0.8, 5.0, 0.0) + np.where(p < 0.2, -5.0, 0.0)
             )
 
             hess = p * (1 - p) + max_drawdown_penalty * np.where(
@@ -174,31 +174,45 @@ class LightGBMCustomObjective:
     @staticmethod
     def rank_based_objective() -> Callable:
         """
-        Rank-based objective that optimizes for proper ordering rather than classification
+        Rank-based objective that optimizes for proper ordering rather than classification.
 
-        Useful for financial prediction where relative ranking matters more than absolute accuracy
+        Useful for financial prediction where relative ranking matters more than absolute accuracy.
+        Optimised from O(n²) to O(n log n) using a sort-then-sweep approach.
         """
         def objective(y_pred: np.ndarray, y_true: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
-            y_true = y_true.get_label()
+            y_true_arr = y_true.get_label()
+            n = len(y_pred)
 
-            # Sort predictions and true labels
+            grad = np.zeros(n, dtype=np.float64)
+            hess = np.ones(n, dtype=np.float64)
+
+            # Sort by predicted score ascending
             sorted_indices = np.argsort(y_pred)
-            y_pred_sorted = y_pred[sorted_indices]
-            y_true_sorted = y_true[sorted_indices]
+            y_true_sorted = y_true_arr[sorted_indices]
 
-            # Rank-based loss: penalize when positive examples are ranked below negative ones
-            grad = np.zeros_like(y_pred)
-            hess = np.zeros_like(y_pred)
+            # Prefix count of positives seen so far (from lower-ranked items)
+            # For each item i (sorted), count positives ranked below it that should be above it
+            prefix_positives = np.zeros(n, dtype=np.float64)
+            running_pos = 0.0
+            for rank, orig_idx in enumerate(sorted_indices):
+                # Positives ranked lower than current item that outrank a negative
+                if y_true_sorted[rank] == 0:  # current item is negative
+                    # All positives seen so far (ranked lower) should be above it
+                    grad[orig_idx] -= running_pos
+                    hess[orig_idx] += running_pos
+                else:  # current item is positive
+                    # Count negatives ranked below that should be below it (already correct) — no penalty
+                    running_pos += 1.0
 
-            for i in range(len(y_pred)):
-                for j in range(i + 1, len(y_pred)):
-                    if y_true_sorted[i] > y_true_sorted[j]:  # Should be ranked higher
-                        if y_pred_sorted[i] < y_pred_sorted[j]:  # But is ranked lower
-                            # Penalize this pair
-                            grad[sorted_indices[i]] += 1
-                            grad[sorted_indices[j]] -= 1
-                            hess[sorted_indices[i]] += 1
-                            hess[sorted_indices[j]] += 1
+            # Second pass: positives get penalty for each negative ranked above them
+            suffix_negatives = 0.0
+            for rank in range(n - 1, -1, -1):
+                orig_idx = sorted_indices[rank]
+                if y_true_sorted[rank] == 1:  # current item is positive
+                    grad[orig_idx] += suffix_negatives
+                    hess[orig_idx] += suffix_negatives
+                else:
+                    suffix_negatives += 1.0
 
             return grad, hess
 
