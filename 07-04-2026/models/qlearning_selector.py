@@ -58,14 +58,14 @@ def _compute_reward(
     ret: float,
     vol: float,
     drawdown: float,
-    lambda_dd: float = 0.5,
+    lambda_drawdown: float = 0.5,
 ) -> float:
     """Sharpe-like reward penalised by squared drawdown.
 
     r = (ret / (vol + 1e-8)) − λ · drawdown²
     """
     normalised_ret = ret / (vol + 1e-8)
-    return normalised_ret - lambda_dd * drawdown ** 2
+    return normalised_ret - lambda_drawdown * drawdown ** 2
 
 
 def _build_action_space(model_names: List[str], max_subset_size: int = 4) -> List[Tuple[str, ...]]:
@@ -96,7 +96,7 @@ class QLearningSelector:
         Minimum exploration rate (default 0.05).
     epsilon_decay:
         Multiplicative decay applied after each episode (default 0.995).
-    lambda_dd:
+    lambda_drawdown:
         Drawdown penalty coefficient in reward function.
     replay_capacity:
         Maximum experiences stored in the replay buffer.
@@ -114,7 +114,7 @@ class QLearningSelector:
         epsilon_start: float = 1.0,
         epsilon_min: float = 0.05,
         epsilon_decay: float = 0.995,
-        lambda_dd: float = 0.5,
+        lambda_drawdown: float = 0.5,
         replay_capacity: int = 2000,
         batch_size: int = 32,
         max_subset_size: int = 4,
@@ -125,7 +125,7 @@ class QLearningSelector:
         self.epsilon = epsilon_start
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
-        self.lambda_dd = lambda_dd
+        self.lambda_drawdown = lambda_drawdown
         self.batch_size = batch_size
 
         # Build finite action space
@@ -189,7 +189,7 @@ class QLearningSelector:
         state = _state_index(state_regime, state_sharpe)
         next_state = _state_index(next_regime, next_sharpe)
         action_idx = self._action_index(tuple(sorted(action_models)))
-        reward = _compute_reward(ret, vol, drawdown, self.lambda_dd)
+        reward = _compute_reward(ret, vol, drawdown, self.lambda_drawdown)
 
         self._replay.append((state, action_idx, reward, next_state))
         self._replay_update()
@@ -210,7 +210,7 @@ class QLearningSelector:
             "gamma": self.gamma,
             "epsilon_min": self.epsilon_min,
             "epsilon_decay": self.epsilon_decay,
-            "lambda_dd": self.lambda_dd,
+            "lambda_drawdown": self.lambda_drawdown,
             "batch_size": self.batch_size,
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -230,7 +230,7 @@ class QLearningSelector:
             epsilon_start=data["epsilon"],
             epsilon_min=data["epsilon_min"],
             epsilon_decay=data["epsilon_decay"],
-            lambda_dd=data["lambda_dd"],
+            lambda_drawdown=data["lambda_drawdown"],
             batch_size=data["batch_size"],
         )
         instance._q = np.array(data["q_table"])
