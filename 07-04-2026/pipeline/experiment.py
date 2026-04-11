@@ -71,6 +71,9 @@ class ExperimentConfig:
     use_qlearning: bool = True
     ql_qtable_path: str = "results/qlearning_qtable.json"
 
+    # ----- DL Regime Detector -----
+    use_dl_regime_detector: bool = True
+
     # ----- LLM -----
     use_llm: bool = True
     llm_cache_ttl: int = 300
@@ -151,6 +154,7 @@ class ExperimentPipeline:
         # Lazy-initialised components
         self._ql_selector = None
         self._llm = None
+        self._regime_detector = None
 
     # ------------------------------------------------------------------ #
     #  Public entry point                                                   #
@@ -184,17 +188,22 @@ class ExperimentPipeline:
             logger.info("[4/7] Initialising Q-learning selector …")
             self._init_qlearning(list(models.keys()))
 
-        # ── Step 5: LLM orchestrator ─────────────────────────────────── #
+        # ── Step 5: DL Regime Detector ─────────────────────────────────── #
+        if self.cfg.use_dl_regime_detector:
+            logger.info("[5/8] Training DL regime detector …")
+            self._init_regime_detector(X)
+
+        # ── Step 6: LLM orchestrator ──────────────────────────────────── #
         if self.cfg.use_llm:
-            logger.info("[5/7] Initialising LLM orchestrator …")
+            logger.info("[6/8] Initialising LLM orchestrator …")
             self._init_llm()
 
-        # ── Step 6: Walk-forward evaluation ─────────────────────────── #
-        logger.info("[6/7] Running walk-forward CV …")
+        # ── Step 7: Walk-forward evaluation ─────────────────────────── #
+        logger.info("[7/8] Running walk-forward CV …")
         cv_results = self._walk_forward(X, y_arr, prices, models)
 
-        # ── Step 7: Summary ──────────────────────────────────────────── #
-        logger.info("[7/7] Computing summary …")
+        # ── Step 8: Summary ───────────────────────────────────────────── #
+        logger.info("[8/8] Computing summary …")
         summary = self._summarise(cv_results, prices, time.time() - t0)
 
         logger.info("=== Pipeline complete in %.1f s ===", time.time() - t0)
@@ -321,6 +330,29 @@ class ExperimentPipeline:
         except Exception as exc:
             logger.warning("LLM orchestrator unavailable: %s", exc)
 
+
+    def _init_regime_detector(self, X: np.ndarray) -> None:
+        """Fit the DL-based regime detector on the full feature matrix."""
+        try:
+            from models.regime_detector import RegimeDetector
+            # Heuristically detect the VIX column (look for a column with high mean)
+            vix_col: Optional[int] = None
+            if X.shape[1] > 7:
+                col_means = X.mean(axis=0)
+                vix_col = int(np.argmax(col_means > 15))
+                if col_means[vix_col] <= 15:
+                    vix_col = None
+            self._regime_detector = RegimeDetector(
+                seq_len=10, hidden=32, n_layers=2, epochs=10,
+                vol_col=0, vix_col=vix_col,
+            )
+            self._regime_detector.fit(X)
+            logger.info(
+                "DL regime detector fitted (torch=%s).",
+                self._regime_detector._fitted,
+            )
+        except Exception as exc:
+            logger.warning("DL regime detector init failed: %s", exc)
     # ------------------------------------------------------------------ #
     #  Walk-forward loop                                                    #
     # ------------------------------------------------------------------ #
@@ -569,7 +601,19 @@ class ExperimentPipeline:
     # ------------------------------------------------------------------ #
 
     def _infer_regime(self, X_val: np.ndarray, prices_val: pd.Series) -> str:
-        """Infer market regime from recent data features."""
+        """Infer market regime from recent data features.
+
+        Priority: (1) DL-based BiLSTM regime detector, (2) LLM orchestrator,
+        (3) rule-based volatility heuristic.
+        """
+        # ── (1) DL-based regime detection (primary) ──────────────────── #
+        if self._regime_detector is not None:
+            try:
+                return self._regime_detector.predict(X_val)
+            except Exception:
+                pass
+
+        # ── (2) LLM orchestrator (secondary) ─────────────────────────── #
         if self._llm is not None:
             try:
                 n = min(5, len(X_val))
@@ -583,7 +627,8 @@ class ExperimentPipeline:
                 return result.get("regime", "sideways")
             except Exception:
                 pass
-        # Rule-based fallback — use only the last 20 days for current-regime detection
+
+        # ── (3) Rule-based fallback ───────────────────────────────────── #
         recent_n = min(20, len(prices_val))
         if recent_n > 2:
             recent_prices = prices_val.values[-recent_n:]

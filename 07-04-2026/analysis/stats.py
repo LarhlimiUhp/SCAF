@@ -23,7 +23,7 @@ class StatisticalAnalyzer:
         return {
             't_stat': float(tstat),
             'p_value': float(pvalue),
-            'outperform': pvalue < 0.05 and np.mean(strategy_returns) > np.mean(benchmark_returns)
+            'outperform': pvalue < 0.001 and np.mean(strategy_returns) > np.mean(benchmark_returns)
         }
 
     @staticmethod
