@@ -42,15 +42,15 @@ class ExperimentConfig:
 
     # ----- Data -----
     ticker: str = "^GSPC"
-    start_date: str = "2006-01-01"
-    end_date: str = "2009-12-31"
+    start_date: str = "2018-01-01"
+    end_date: str = "2024-12-31"
     horizon: int = 5                # prediction horizon (trading days)
 
     # ----- Models -----
     model_names: List[str] = field(default_factory=lambda: [
         "LogReg-L2", "RandomForest", "LGBM", "KNN",
         "BiLSTM", "XGBoost", "ExtraTrees", "HistGBT", "MLP",
-        "RidgeClass", "Bagging",
+        "RidgeClass", "Bagging", "TabNet", "GraphNN", "CatBoost",
     ])
 
     # ----- Walk-forward CV -----
@@ -406,13 +406,18 @@ class ExperimentPipeline:
             return {"fold": fold_idx, "error": "all models failed"}
 
         # ── Conformal calibration ─────────────────────────────────────── #
+        _conformal_ensemble = None
         if self.cfg.use_conformal:
             from models.conformal import ConformalEnsemble
             fitted_models = list(trained.values())
-            ensemble = ConformalEnsemble(fitted_models, alpha=self.cfg.conformal_alpha)
-            ensemble.calibrate(X_cal, y_cal)
+            _conformal_ensemble = ConformalEnsemble(
+                fitted_models, alpha=self.cfg.conformal_alpha
+            )
+            _conformal_ensemble.calibrate(X_cal, y_cal)
             logger.info(
-                "Fold %d conformal q_hat=%.4f", fold_idx, ensemble.q_hat or float("nan")
+                "Fold %d conformal q_hat=%.4f",
+                fold_idx,
+                _conformal_ensemble.q_hat or float("nan"),
             )
 
         # ── Regime detection (used for model selection and signal scaling) ── #
@@ -438,18 +443,33 @@ class ExperimentPipeline:
         # ── Walk-forward signal generation ───────────────────────────── #
         portfolio_returns = []
         signals = []
+        all_probs: List[float] = []
+        coverage_hits: List[int] = []
+        step_latencies_ms: List[float] = []
         for i in range(len(X_val)):
             x_row = X_val[i:i+1]
 
-            # Aggregate signals from active models
+            # Aggregate signals from active models (timed for latency tracking)
+            _t_step = time.time()
             probs = []
             for name in active_model_names:
                 p, _ = trained[name].predict_proba_one(x_row)
                 probs.append(p)
+            step_latencies_ms.append((time.time() - _t_step) * 1000.0)
+
             prob = float(np.mean(probs)) if probs else 0.5
             # Gradual signal in [-1, 1]; position scaling applied via pos_scalar
             signal = (prob - 0.5) * 2.0
             signals.append(signal)
+            all_probs.append(prob)
+
+            # Conformal coverage: check whether true label is in prediction set
+            if _conformal_ensemble is not None:
+                try:
+                    pred_set = _conformal_ensemble.predict_set(x_row)
+                    coverage_hits.append(int(y_val[i] in pred_set))
+                except Exception:
+                    pass
 
             # Position scalar: regime-adjusted baseline, optionally overridden by LLM
             pos_scalar = regime_pos_scalar
@@ -487,6 +507,21 @@ class ExperimentPipeline:
         fold_sharpe = _sharpe(ret_arr) if len(ret_arr) > 1 else 0.0
         fold_dd = _max_drawdown(np.exp(np.cumsum(ret_arr)))
 
+        # RMSE of ensemble probability vs true binary label (Brier RMSE)
+        _proba_arr = np.array(all_probs)
+        _y_aligned = y_val[: len(_proba_arr)].astype(float)
+        fold_rmse = float(
+            np.sqrt(np.mean((_proba_arr - _y_aligned) ** 2))
+        ) if len(_proba_arr) > 0 else float("nan")
+
+        # Conformal coverage rate
+        coverage_rate = float(np.mean(coverage_hits)) if coverage_hits else float("nan")
+
+        # Mean per-step inference latency
+        mean_latency_ms = (
+            float(np.mean(step_latencies_ms)) if step_latencies_ms else float("nan")
+        )
+
         logger.info(
             "Fold %d: cum_ret=%.4f sharpe=%.3f max_dd=%.4f auc=%s",
             fold_idx, cum_ret, fold_sharpe, fold_dd,
@@ -522,6 +557,9 @@ class ExperimentPipeline:
             "cum_return": cum_ret,
             "sharpe": fold_sharpe,
             "max_drawdown": fold_dd,
+            "rmse": fold_rmse,
+            "coverage_rate": coverage_rate,
+            "mean_latency_ms": mean_latency_ms,
             "signals": signals,
             "portfolio_returns": ret_arr.tolist(),
         }
@@ -586,6 +624,44 @@ class ExperimentPipeline:
                 model_aucs.setdefault(m, []).append(auc)
         mean_model_auc = {m: float(np.mean(v)) for m, v in model_aucs.items()}
 
+        # Mean RMSE (Brier) across folds
+        fold_rmses = [r["rmse"] for r in valid
+                      if not np.isnan(r.get("rmse", float("nan")))]
+        mean_rmse = float(np.mean(fold_rmses)) if fold_rmses else float("nan")
+
+        # Conformal coverage rate
+        fold_coverages = [r["coverage_rate"] for r in valid
+                          if not np.isnan(r.get("coverage_rate", float("nan")))]
+        mean_coverage = float(np.mean(fold_coverages)) if fold_coverages else float("nan")
+
+        # Mean per-step inference latency (ms)
+        fold_latencies = [r["mean_latency_ms"] for r in valid
+                          if not np.isnan(r.get("mean_latency_ms", float("nan")))]
+        mean_latency_ms = (
+            float(np.mean(fold_latencies)) if fold_latencies else float("nan")
+        )
+
+        # Statistical significance test (paired t-test vs buy-and-hold)
+        stat_test: Dict[str, Any] = {}
+        bnh_aligned = bnh_rets[-len(all_returns):]
+        if len(bnh_aligned) == len(all_returns):
+            try:
+                from analysis.stats import StatisticalAnalyzer
+                stat_test = StatisticalAnalyzer.performance_ttest(
+                    all_returns, bnh_aligned
+                )
+            except Exception as exc:
+                logger.warning("Stat test failed: %s", exc)
+
+        # 15-baseline Sharpe comparison
+        baseline_sharpes: Dict[str, float] = {}
+        for strat_name, strat_fn in BenchmarkStrategies.all_strategies().items():
+            try:
+                strat_rets = strat_fn(prices).dropna().values
+                baseline_sharpes[strat_name] = round(_sharpe(strat_rets), 4)
+            except Exception:
+                pass
+
         # Save Q-table if enabled
         if self._ql_selector is not None:
             try:
@@ -600,6 +676,15 @@ class ExperimentPipeline:
             "sharpe_ratio": round(total_sharpe, 4),
             "max_drawdown": round(max_dd, 4),
             "excess_return_vs_bnh": round(excess_ret, 6),
+            "rmse_brier": round(mean_rmse, 6) if not np.isnan(mean_rmse) else None,
+            "conformal_coverage_rate": (
+                round(mean_coverage, 4) if not np.isnan(mean_coverage) else None
+            ),
+            "mean_inference_latency_ms": (
+                round(mean_latency_ms, 3) if not np.isnan(mean_latency_ms) else None
+            ),
+            "stat_test_vs_bnh": stat_test,
+            "baseline_sharpe_ratios": baseline_sharpes,
             "mean_model_auc": {k: round(v, 4) for k, v in mean_model_auc.items()},
             "elapsed_seconds": round(elapsed, 1),
         }
