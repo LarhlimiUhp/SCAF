@@ -1,0 +1,47 @@
+{
+  "full_scaf": {
+    "sharpe": -0.4138,
+    "max_dd": -0.142,
+    "rmse": 0.545388,
+    "coverage": 0.9631,
+    "excess_ret": 0.877236,
+    "latency_ms": 2.0,
+    "folds": 1
+  },
+  "no_qlearning": {
+    "sharpe": 0.2488,
+    "max_dd": -0.061,
+    "rmse": 0.509729,
+    "coverage": 0.9619,
+    "excess_ret": 1.008749,
+    "latency_ms": 28.506,
+    "folds": 1
+  },
+  "no_conformal": {
+    "sharpe": 0.4211,
+    "max_dd": -0.0495,
+    "rmse": 0.502179,
+    "coverage": null,
+    "excess_ret": 1.007184,
+    "latency_ms": 7.57,
+    "folds": 1
+  },
+  "single_model": {
+    "sharpe": -1.513,
+    "max_dd": -0.0424,
+    "rmse": 0.502606,
+    "coverage": null,
+    "excess_ret": 0.937586,
+    "latency_ms": 3.174,
+    "folds": 1
+  },
+  "minimal": {
+    "sharpe": -1.2356,
+    "max_dd": -0.0645,
+    "rmse": 0.505541,
+    "coverage": null,
+    "excess_ret": 0.918861,
+    "latency_ms": 14.543,
+    "folds": 1
+  }
+}
