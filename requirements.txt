@@ -1,0 +1,38 @@
+# Core scientific computing
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# Machine learning
+scikit-learn>=1.0.0
+lightgbm>=3.3.0
+optuna>=2.10.0
+shap>=0.40.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.0.0
+
+# System & utilities
+psutil>=5.8.0
+joblib>=1.1.0
+tqdm>=4.62.0
+requests>=2.25.0
+
+# Dashboard
+streamlit>=1.10.0
+
+# Monitoring (optional)
+prometheus-client>=0.12.0
+python-json-logger>=2.0.0
+
+# Market data (optional — local CSV fallback is available)
+yfinance>=0.2.0
+
+# Deep learning (optional)
+# torch>=1.12.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
