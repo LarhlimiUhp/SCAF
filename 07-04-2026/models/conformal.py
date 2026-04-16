@@ -323,3 +323,155 @@ class ConformalEnsemble:
         if not probs:
             return 0.5
         return float(np.mean(probs))
+
+
+# ─────────────────────── AdaptiveConformalEnsemble ──────────────────────── #
+
+class AdaptiveConformalEnsemble:
+    """Ensemble conformal predictor with online ACI adaptation for time series.
+
+    Combines split-conformal seeding (from a held-out calibration set) with
+    the ACI online update rule to maintain marginal coverage ≥ 1−α even
+    under distribution shift and non-stationarity.
+
+    Online update rule (Gibbs & Candès 2021):
+        α_{t+1} = clip(α_t + γ·(α − err_t), α_min, α_max)
+    where err_t = 1 if y_t ∉ Ĉ_t(x_t) else 0.
+
+    Parameters
+    ----------
+    models:
+        List of fitted BaseModel instances.
+    alpha:
+        Target miscoverage level (default 0.05 → 95 % coverage).
+    gamma:
+        Step-size for the online α update (default 0.005).
+    alpha_min, alpha_max:
+        Clipping bounds for α_t.
+    """
+
+    def __init__(
+        self,
+        models: List[BaseModel],
+        alpha: float = 0.05,
+        gamma: float = 0.005,
+        alpha_min: float = 0.005,
+        alpha_max: float = 0.50,
+    ):
+        if not models:
+            raise ValueError("models list must be non-empty.")
+        self.models = models
+        self.alpha = alpha
+        self.gamma = gamma
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+
+        self.alpha_t = alpha          # current adaptive miscoverage level
+        self._scores: List[float] = []  # all non-conformity scores seen so far
+        self._errors: List[int] = []    # 1=miss, 0=covered
+        self._q_hat: Optional[float] = None
+        self._calibrated: bool = False
+
+    # ------------------------------------------------------------------ #
+
+    def calibrate(
+        self, X_cal: np.ndarray, y_cal: np.ndarray
+    ) -> "AdaptiveConformalEnsemble":
+        """Seed the running score buffer from the calibration set.
+
+        This gives the predictor a warm-start so that q_hat is meaningful
+        from the very first validation step.
+        """
+        n = len(y_cal)
+        for i in range(n):
+            p = self._ensemble_proba(X_cal[i : i + 1])
+            true_prob = p if y_cal[i] == 1 else 1.0 - p
+            self._scores.append(1.0 - true_prob)
+
+        self._q_hat = self._compute_q_hat()
+        self._calibrated = True
+
+        empirical_cov = float(np.mean(np.array(self._scores) <= self._q_hat))
+        logger.info(
+            "AdaptiveConformalEnsemble seeded: n_cal=%d, α_0=%.3f, "
+            "q_hat=%.4f, cal_coverage=%.3f",
+            n, self.alpha_t, self._q_hat, empirical_cov,
+        )
+        return self
+
+    def predict_set(self, X_row: np.ndarray) -> List[int]:
+        """Return the adaptive prediction set for *X_row* (no state update)."""
+        q = self._q_hat if self._q_hat is not None else 1.0
+        p = self._ensemble_proba(X_row)
+        result = []
+        for label in (0, 1):
+            true_prob = p if label == 1 else 1.0 - p
+            if (1.0 - true_prob) <= q:
+                result.append(label)
+        return result
+
+    def predict_set_and_update(
+        self, X_row: np.ndarray, y_true: int
+    ) -> Tuple[List[int], bool]:
+        """Predict, observe the true label, update ACI state.
+
+        Returns
+        -------
+        prediction_set : List[int]
+            The prediction set *before* observing y_true.
+        covered : bool
+            Whether y_true ∈ prediction_set.
+        """
+        pred_set = self.predict_set(X_row)
+
+        # Compute non-conformity score for this sample
+        p = self._ensemble_proba(X_row)
+        true_prob = p if y_true == 1 else 1.0 - p
+        score = 1.0 - true_prob
+
+        # Check coverage, record error
+        covered = y_true in pred_set
+        err_t = 0 if covered else 1
+        self._errors.append(err_t)
+        self._scores.append(score)
+
+        # ACI alpha update: α_{t+1} = clip(α_t + γ·(α − err_t))
+        self.alpha_t = float(
+            np.clip(
+                self.alpha_t + self.gamma * (self.alpha - err_t),
+                self.alpha_min,
+                self.alpha_max,
+            )
+        )
+
+        # Recompute q_hat with updated alpha_t and new score included
+        self._q_hat = self._compute_q_hat()
+
+        return pred_set, covered
+
+    def empirical_coverage(self) -> float:
+        """Fraction of *validation* steps where the true label was covered."""
+        if not self._errors:
+            return float("nan")
+        return 1.0 - float(np.mean(self._errors))
+
+    @property
+    def q_hat(self) -> Optional[float]:
+        return self._q_hat
+
+    # ------------------------------------------------------------------ #
+
+    def _compute_q_hat(self) -> float:
+        n = len(self._scores)
+        if n == 0:
+            return 1.0
+        level = min(np.ceil((n + 1) * (1.0 - self.alpha_t)) / n, 1.0)
+        return float(np.quantile(self._scores, level))
+
+    def _ensemble_proba(self, X_row: np.ndarray) -> float:
+        probs = []
+        for model in self.models:
+            if model.is_fitted:
+                p, _ = model.predict_proba_one(X_row)
+                probs.append(p)
+        return float(np.mean(probs)) if probs else 0.5

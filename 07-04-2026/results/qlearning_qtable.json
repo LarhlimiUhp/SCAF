@@ -6729,7 +6729,7 @@
     "RidgeClass",
     "Bagging"
   ],
-  "epsilon": 0.8911090557802088,
+  "epsilon": 0.8866535105013078,
   "alpha": 0.1,
   "gamma": 0.9,
   "epsilon_min": 0.05,

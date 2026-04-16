@@ -437,20 +437,27 @@ class ExperimentPipeline:
         if not trained:
             return {"fold": fold_idx, "error": "all models failed"}
 
-        # ── Conformal calibration ─────────────────────────────────────── #
+        # ── Conformal calibration (split-conformal seed + ACI online) ── #
         _conformal_ensemble = None
+        _aci_ensemble = None
         if self.cfg.use_conformal:
-            from models.conformal import ConformalEnsemble
+            from models.conformal import ConformalEnsemble, AdaptiveConformalEnsemble
             fitted_models = list(trained.values())
+            # Split-conformal (static) — for reference q_hat logging
             _conformal_ensemble = ConformalEnsemble(
                 fitted_models, alpha=self.cfg.conformal_alpha
             )
             _conformal_ensemble.calibrate(X_cal, y_cal)
             logger.info(
-                "Fold %d conformal q_hat=%.4f",
+                "Fold %d split-conformal q_hat=%.4f",
                 fold_idx,
                 _conformal_ensemble.q_hat or float("nan"),
             )
+            # Adaptive conformal (ACI) — seeded from calibration, updated online
+            _aci_ensemble = AdaptiveConformalEnsemble(
+                fitted_models, alpha=self.cfg.conformal_alpha, gamma=0.005
+            )
+            _aci_ensemble.calibrate(X_cal, y_cal)
 
         # ── Regime detection (used for model selection and signal scaling) ── #
         regime_label = self._infer_regime(X_val, prices_val)
@@ -472,11 +479,22 @@ class ExperimentPipeline:
         else:
             regime_pos_scalar = self.cfg.position_scalar
 
+        # ── DL baseline identification (BiLSTM or best DL model) ─────── #
+        _DL_CANDIDATES = ["BiLSTM", "GraphNN", "MLP", "TabNet"]
+        dl_baseline_name: Optional[str] = next(
+            (n for n in _DL_CANDIDATES if n in trained), None
+        )
+        dl_baseline_probs: List[float] = []
+        dl_baseline_returns: List[float] = []
+
         # ── Walk-forward signal generation ───────────────────────────── #
         portfolio_returns = []
         signals = []
         all_probs: List[float] = []
-        coverage_hits: List[int] = []
+        # Split-conformal coverage hits (static q_hat, for reference)
+        static_coverage_hits: List[int] = []
+        # ACI coverage hits (adaptive q_hat, the primary coverage metric)
+        aci_coverage_hits: List[int] = []
         step_latencies_ms: List[float] = []
         for i in range(len(X_val)):
             x_row = X_val[i:i+1]
@@ -495,11 +513,36 @@ class ExperimentPipeline:
             signals.append(signal)
             all_probs.append(prob)
 
-            # Conformal coverage: check whether true label is in prediction set
+            # Static split-conformal coverage (reference only)
             if _conformal_ensemble is not None:
                 try:
                     pred_set = _conformal_ensemble.predict_set(x_row)
-                    coverage_hits.append(int(y_val[i] in pred_set))
+                    static_coverage_hits.append(int(y_val[i] in pred_set))
+                except Exception:
+                    pass
+
+            # ACI online coverage: predict then update with true label
+            if _aci_ensemble is not None:
+                try:
+                    _, covered = _aci_ensemble.predict_set_and_update(x_row, int(y_val[i]))
+                    aci_coverage_hits.append(int(covered))
+                except Exception:
+                    pass
+
+            # DL baseline tracking (single-model forward pass)
+            if dl_baseline_name is not None:
+                try:
+                    dl_p, _ = trained[dl_baseline_name].predict_proba_one(x_row)
+                    dl_baseline_probs.append(dl_p)
+                    if i + 1 < len(prices_val):
+                        dl_sig = (dl_p - 0.5) * 2.0
+                        _daily = float(
+                            np.log(prices_val.iloc[i + 1] / (prices_val.iloc[i] + 1e-12))
+                        )
+                        dl_baseline_returns.append(
+                            dl_sig * regime_pos_scalar * _daily
+                            - self.cfg.transaction_cost * abs(dl_sig)
+                        )
                 except Exception:
                     pass
 
@@ -546,8 +589,26 @@ class ExperimentPipeline:
             np.sqrt(np.mean((_proba_arr - _y_aligned) ** 2))
         ) if len(_proba_arr) > 0 else float("nan")
 
-        # Conformal coverage rate
-        coverage_rate = float(np.mean(coverage_hits)) if coverage_hits else float("nan")
+        # DL baseline fold metrics
+        dl_ret_arr = np.array(dl_baseline_returns)
+        _dl_y = y_val[: len(dl_baseline_probs)].astype(float)
+        fold_dl_rmse = float(
+            np.sqrt(np.mean((np.array(dl_baseline_probs) - _dl_y) ** 2))
+        ) if dl_baseline_probs else float("nan")
+        fold_dl_sharpe = _sharpe(dl_ret_arr) if len(dl_ret_arr) > 1 else float("nan")
+        fold_dl_dd = (
+            _max_drawdown(np.exp(np.cumsum(dl_ret_arr)))
+            if len(dl_ret_arr) > 1 else float("nan")
+        )
+
+        # Static conformal coverage rate (reference)
+        coverage_rate = (
+            float(np.mean(static_coverage_hits)) if static_coverage_hits else float("nan")
+        )
+        # ACI online coverage rate (primary — should be ≥ 1−α)
+        aci_coverage_rate = (
+            float(np.mean(aci_coverage_hits)) if aci_coverage_hits else float("nan")
+        )
 
         # Mean per-step inference latency
         mean_latency_ms = (
@@ -555,8 +616,11 @@ class ExperimentPipeline:
         )
 
         logger.info(
-            "Fold %d: cum_ret=%.4f sharpe=%.3f max_dd=%.4f auc=%s",
+            "Fold %d: cum_ret=%.4f sharpe=%.3f max_dd=%.4f "
+            "aci_cov=%.3f dl_rmse=%.4f auc=%s",
             fold_idx, cum_ret, fold_sharpe, fold_dd,
+            aci_coverage_rate if not np.isnan(aci_coverage_rate) else float("nan"),
+            fold_dl_rmse if not np.isnan(fold_dl_rmse) else float("nan"),
             {k: f"{v:.3f}" for k, v in model_auc.items()},
         )
 
@@ -586,11 +650,18 @@ class ExperimentPipeline:
             "n_val": len(X_val),
             "model_auc": model_auc,
             "active_models": active_model_names,
+            "dl_baseline_name": dl_baseline_name,
             "cum_return": cum_ret,
             "sharpe": fold_sharpe,
             "max_drawdown": fold_dd,
             "rmse": fold_rmse,
+            # DL baseline per-fold metrics
+            "dl_baseline_rmse": fold_dl_rmse,
+            "dl_baseline_sharpe": fold_dl_sharpe,
+            "dl_baseline_drawdown": fold_dl_dd,
+            # Conformal coverage: static (reference) and ACI (primary)
             "coverage_rate": coverage_rate,
+            "aci_coverage_rate": aci_coverage_rate,
             "mean_latency_ms": mean_latency_ms,
             "signals": signals,
             "portfolio_returns": ret_arr.tolist(),
@@ -669,17 +740,61 @@ class ExperimentPipeline:
                 model_aucs.setdefault(m, []).append(auc)
         mean_model_auc = {m: float(np.mean(v)) for m, v in model_aucs.items()}
 
-        # Mean RMSE (Brier) across folds
+        # ── RMSE (Brier) — SCAF ensemble ──────────────────────────────── #
         fold_rmses = [r["rmse"] for r in valid
                       if not np.isnan(r.get("rmse", float("nan")))]
         mean_rmse = float(np.mean(fold_rmses)) if fold_rmses else float("nan")
 
-        # Conformal coverage rate
+        # ── DL baseline aggregate metrics ─────────────────────────────── #
+        dl_names = [r.get("dl_baseline_name") for r in valid if r.get("dl_baseline_name")]
+        dl_baseline_name = dl_names[0] if dl_names else None
+
+        def _safe_mean(lst: List[float]) -> Optional[float]:
+            vals = [v for v in lst if not np.isnan(v)]
+            return float(np.mean(vals)) if vals else None
+
+        dl_rmses = [r.get("dl_baseline_rmse", float("nan")) for r in valid]
+        dl_sharpes = [r.get("dl_baseline_sharpe", float("nan")) for r in valid]
+        dl_dds = [r.get("dl_baseline_drawdown", float("nan")) for r in valid]
+
+        mean_dl_rmse = _safe_mean(dl_rmses)
+        mean_dl_sharpe = _safe_mean(dl_sharpes)
+        mean_dl_dd = _safe_mean(dl_dds)
+
+        # ── % improvement vs DL baseline ─────────────────────────────── #
+        rmse_reduction_pct: Optional[float] = None
+        if mean_dl_rmse is not None and not np.isnan(mean_rmse) and mean_dl_rmse > 1e-9:
+            rmse_reduction_pct = round(
+                (mean_dl_rmse - mean_rmse) / mean_dl_rmse * 100.0, 2
+            )
+
+        sharpe_improvement_pct: Optional[float] = None
+        if mean_dl_sharpe is not None and abs(mean_dl_sharpe) > 1e-9:
+            sharpe_improvement_pct = round(
+                (total_sharpe - mean_dl_sharpe) / abs(mean_dl_sharpe) * 100.0, 2
+            )
+
+        drawdown_reduction_pct: Optional[float] = None
+        if mean_dl_dd is not None and abs(mean_dl_dd) > 1e-9:
+            # Both values are negative; smaller absolute value = better
+            drawdown_reduction_pct = round(
+                (abs(mean_dl_dd) - abs(max_dd)) / abs(mean_dl_dd) * 100.0, 2
+            )
+
+        # ── Conformal coverage rates ──────────────────────────────────── #
+        # Static split-conformal (reference; may drop under distribution shift)
         fold_coverages = [r["coverage_rate"] for r in valid
                           if not np.isnan(r.get("coverage_rate", float("nan")))]
         mean_coverage = float(np.mean(fold_coverages)) if fold_coverages else float("nan")
 
-        # Mean per-step inference latency (ms)
+        # ACI online coverage (primary; tracks target ≥ 1−α under shift)
+        fold_aci_coverages = [r["aci_coverage_rate"] for r in valid
+                              if not np.isnan(r.get("aci_coverage_rate", float("nan")))]
+        mean_aci_coverage = (
+            float(np.mean(fold_aci_coverages)) if fold_aci_coverages else float("nan")
+        )
+
+        # ── Inference latency ─────────────────────────────────────────── #
         fold_latencies = [r["mean_latency_ms"] for r in valid
                           if not np.isnan(r.get("mean_latency_ms", float("nan")))]
         mean_latency_ms = (
@@ -721,9 +836,29 @@ class ExperimentPipeline:
             "sharpe_ratio": round(total_sharpe, 4),
             "max_drawdown": round(max_dd, 4),
             "excess_return_vs_bnh": round(excess_ret, 6),
+            # RMSE (Brier)
             "rmse_brier": round(mean_rmse, 6) if not np.isnan(mean_rmse) else None,
-            "conformal_coverage_rate": (
+            # DL baseline metrics
+            "dl_baseline_name": dl_baseline_name,
+            "dl_baseline_rmse_brier": (
+                round(mean_dl_rmse, 6) if mean_dl_rmse is not None else None
+            ),
+            "dl_baseline_sharpe": (
+                round(mean_dl_sharpe, 4) if mean_dl_sharpe is not None else None
+            ),
+            "dl_baseline_max_drawdown": (
+                round(mean_dl_dd, 4) if mean_dl_dd is not None else None
+            ),
+            # % improvement vs DL baseline
+            "rmse_reduction_vs_dl_pct": rmse_reduction_pct,
+            "sharpe_improvement_vs_dl_pct": sharpe_improvement_pct,
+            "drawdown_reduction_vs_dl_pct": drawdown_reduction_pct,
+            # Conformal coverage
+            "conformal_coverage_rate_static": (
                 round(mean_coverage, 4) if not np.isnan(mean_coverage) else None
+            ),
+            "conformal_coverage_rate_aci": (
+                round(mean_aci_coverage, 4) if not np.isnan(mean_aci_coverage) else None
             ),
             "mean_inference_latency_ms": (
                 round(mean_latency_ms, 3) if not np.isnan(mean_latency_ms) else None
