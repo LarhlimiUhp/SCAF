@@ -61,6 +61,10 @@ class ExperimentConfig:
     # ----- Trading -----
     transaction_cost: float = 0.0003
     position_scalar: float = 1.0
+    # Per-fold AUC threshold: models below this are excluded from the ensemble
+    min_model_auc: float = 0.50
+    # Weight ensemble votes by (AUC − 0.5) instead of uniform average
+    auc_weighted_ensemble: bool = True
 
     # ----- Conformal prediction -----
     use_conformal: bool = True
@@ -155,6 +159,7 @@ class ExperimentPipeline:
         self._ql_selector = None
         self._llm = None
         self._regime_detector = None
+        self._vix_col_idx: Optional[int] = None   # set in run() from feature columns
 
     # ------------------------------------------------------------------ #
     #  Public entry point                                                   #
@@ -178,6 +183,11 @@ class ExperimentPipeline:
         logger.info("[2/7] Converting features …")
         X = X_raw.values.astype(np.float32)
         y_arr = y.values.astype(int)
+        # Store column index of VIX feature for regime detection
+        self._vix_col_idx: Optional[int] = (
+            int(list(X_raw.columns).index("vix"))
+            if "vix" in X_raw.columns else None
+        )
 
         # ── Step 3: Models ──────────────────────────────────────────── #
         logger.info("[3/7] Initialising models …")
@@ -463,19 +473,33 @@ class ExperimentPipeline:
         regime_label = self._infer_regime(X_val, prices_val)
         recent_sharpe = _rolling_sharpe(np.diff(np.log(prices_val.values + 1e-12)))
 
+        # ── AUC-filtered model pool: drop models below min_model_auc ─── #
+        auc_filtered_names = [
+            n for n in trained
+            if model_auc.get(n, 0.0) >= self.cfg.min_model_auc
+        ]
+        # Keep at least the best model so ensemble is never empty
+        if not auc_filtered_names:
+            best_name = max(model_auc, key=model_auc.get)
+            auc_filtered_names = [best_name]
+        logger.info(
+            "Fold %d: AUC-filtered pool=%s (threshold=%.2f)",
+            fold_idx, auc_filtered_names, self.cfg.min_model_auc,
+        )
+
         # ── Q-learning model selection ────────────────────────────────── #
-        active_model_names = list(trained.keys())
-        if self._ql_selector is not None and active_model_names:
+        active_model_names = auc_filtered_names
+        if self._ql_selector is not None and auc_filtered_names:
             ql_selection = self._ql_selector.select(regime_label, recent_sharpe)
-            active_model_names = [m for m in ql_selection if m in trained]
-            if not active_model_names:
-                active_model_names = list(trained.keys())
+            ql_filtered = [m for m in ql_selection if m in auc_filtered_names]
+            if ql_filtered:
+                active_model_names = ql_filtered
 
         # Regime-aware base position scalar: reduce aggressiveness in adverse regimes
         if regime_label == "crisis":
             regime_pos_scalar = 0.25
         elif regime_label == "bear":
-            regime_pos_scalar = 0.60
+            regime_pos_scalar = 0.50
         else:
             regime_pos_scalar = self.cfg.position_scalar
 
@@ -499,15 +523,25 @@ class ExperimentPipeline:
         for i in range(len(X_val)):
             x_row = X_val[i:i+1]
 
-            # Aggregate signals from active models (timed for latency tracking)
+            # Aggregate signals: AUC-weighted or equal-weight average
             _t_step = time.time()
             probs = []
+            weights = []
             for name in active_model_names:
                 p, _ = trained[name].predict_proba_one(x_row)
                 probs.append(p)
+                # Weight = excess AUC above chance (AUC − 0.5), floored at 1e-4
+                weights.append(max(1e-4, model_auc.get(name, 0.5) - 0.5))
             step_latencies_ms.append((time.time() - _t_step) * 1000.0)
 
-            prob = float(np.mean(probs)) if probs else 0.5
+            if probs:
+                if self.cfg.auc_weighted_ensemble and any(w > 1e-4 for w in weights):
+                    w_arr = np.array(weights)
+                    prob = float(np.dot(w_arr, probs) / w_arr.sum())
+                else:
+                    prob = float(np.mean(probs))
+            else:
+                prob = 0.5
             # Gradual signal in [-1, 1]; position scaling applied via pos_scalar
             signal = (prob - 0.5) * 2.0
             signals.append(signal)
@@ -699,14 +733,29 @@ class ExperimentPipeline:
             except Exception:
                 pass
 
-        # ── (3) Rule-based fallback ───────────────────────────────────── #
+        # ── (3) Rule-based fallback — use actual VIX column when available ── #
         recent_n = min(20, len(prices_val))
         if recent_n > 2:
             recent_prices = prices_val.values[-recent_n:]
             vol_est = float(np.std(np.diff(np.log(recent_prices + 1e-12))))
         else:
             vol_est = 0.01
-        return _detect_regime(vol_est)
+
+        # Extract real VIX level from the feature matrix (unscaled proxy)
+        vix_level = 20.0
+        vix_col = getattr(self, "_vix_col_idx", None)
+        if vix_col is not None and X_val.shape[1] > vix_col and len(X_val) > 0:
+            raw_vix = float(np.nanmean(np.abs(X_val[-min(5, len(X_val)):, vix_col])))
+            # After StandardScaler the column is z-scored; restore scale heuristically:
+            # VIX mean≈20, std≈8 → if z > 1.5 → VIX>32 → crisis
+            if raw_vix > 1.5:
+                vix_level = 35.0
+            elif raw_vix > 0.8:
+                vix_level = 25.0
+            else:
+                vix_level = 18.0
+
+        return _detect_regime(vol_est, vix=vix_level)
 
     def _summarise(
         self,
