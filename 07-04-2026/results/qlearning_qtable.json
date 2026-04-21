@@ -25915,7 +25915,7 @@
     "GraphNN",
     "CatBoost"
   ],
-  "epsilon": 0.2970075,
+  "epsilon": 0.3,
   "alpha": 0.1,
   "gamma": 0.9,
   "epsilon_min": 0.05,

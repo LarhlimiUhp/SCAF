@@ -61,18 +61,43 @@ class ExperimentConfig:
     # ----- Trading -----
     transaction_cost: float = 0.0003
     position_scalar: float = 1.0
-    # Per-fold AUC threshold: models below this are excluded from the ensemble
-    min_model_auc: float = 0.50
+    # Per-fold AUC threshold: models below this are excluded from the ensemble.
+    # Raised from 0.50 → 0.52 to eliminate weak models that dilute the signal.
+    min_model_auc: float = 0.52
     # Weight ensemble votes by (AUC − 0.5) instead of uniform average
     auc_weighted_ensemble: bool = True
+    # Dead-zone: signals with |signal| < signal_threshold are set to 0 to
+    # avoid noisy low-conviction trades and reduce unnecessary transaction costs.
+    signal_threshold: float = 0.02
+    # Kelly fraction for position sizing (1.0 = full signal, < 1.0 = fractional).
+    kelly_fraction: float = 1.0
+
+    # ----- Dynamic risk management -----
+    # When enabled, position size is scaled down in real-time based on realised
+    # portfolio volatility and drawdown — not just once per fold as the
+    # fold-level regime detector does.
+    use_dynamic_risk: bool = True
+    # Annualised volatility target: daily vol above this triggers position reduction.
+    vol_target: float = 0.15   # 15% annualised (≈ 0.94% daily)
+    # Maximum portfolio drawdown before halving positions.
+    max_portfolio_dd: float = 0.12   # pause when portfolio drops 12% from peak
+    # Trend filter: suppress signals that contradict the medium-term price trend.
+    # Reduces whipsawing during large trending moves (crashes, strong bull runs).
+    use_trend_filter: bool = True
+    trend_lookback: int = 20   # days; 20 reacts faster than 50 to trend reversals
 
     # ----- Conformal prediction -----
-    use_conformal: bool = True
-    conformal_alpha: float = 0.05      # target miscoverage
+    # Disabled by default: ablation shows Sharpe +0.42 without conformal vs
+    # −0.41 with full SCAF, because overly wide prediction sets suppress trading.
+    use_conformal: bool = False
+    conformal_alpha: float = 0.10      # target miscoverage (less conservative than 0.05)
     calibration_fraction: float = 0.20 # fraction of train set used for calibration
 
     # ----- Q-learning -----
-    use_qlearning: bool = True
+    # Disabled by default: the pre-trained Q-table was trained on a bad regime
+    # detector (always returning "bull") and degrades performance (Sharpe −0.41
+    # with Q-learning vs +0.25 without).  Re-enable only after retraining.
+    use_qlearning: bool = False
     ql_qtable_path: str = "results/qlearning_qtable.json"
 
     # ----- DL Regime Detector -----
@@ -554,6 +579,10 @@ class ExperimentPipeline:
         # ACI coverage hits (adaptive q_hat, the primary coverage metric)
         aci_coverage_hits: List[int] = []
         step_latencies_ms: List[float] = []
+        # Track portfolio cumulative value for dynamic drawdown monitoring
+        _port_cum_peak: float = 1.0
+        _port_cum_val: float = 1.0
+
         for i in range(len(X_val)):
             x_row = X_val[i:i+1]
 
@@ -576,8 +605,32 @@ class ExperimentPipeline:
                     prob = float(np.mean(probs))
             else:
                 prob = 0.5
-            # Gradual signal in [-1, 1]; position scaling applied via pos_scalar
+            # Gradual signal in [-1, 1]
             signal = (prob - 0.5) * 2.0
+
+            # Dead-zone: suppress weak signals to avoid noisy low-conviction trades
+            if abs(signal) < self.cfg.signal_threshold:
+                signal = 0.0
+
+            # Trend filter: suppress signals that contradict the medium-term
+            # price trend to avoid whipsawing during large directional moves.
+            if self.cfg.use_trend_filter and signal != 0.0:
+                lb = self.cfg.trend_lookback
+                start_idx = max(0, i - lb)
+                trend_prices = prices_val.iloc[start_idx: i + 1].values
+                if len(trend_prices) >= 5:
+                    trend_ret = float(
+                        np.log(trend_prices[-1] / (trend_prices[0] + 1e-12))
+                    )
+                    # Suppress long in downtrend; suppress short in uptrend
+                    if trend_ret < -0.02 and signal > 0:
+                        signal = 0.0
+                    elif trend_ret > 0.02 and signal < 0:
+                        signal = 0.0
+
+            # Kelly position sizing (kelly_fraction < 1.0 = conservative scaling)
+            if self.cfg.kelly_fraction > 0 and self.cfg.kelly_fraction < 1.0:
+                signal *= self.cfg.kelly_fraction
             signals.append(signal)
             all_probs.append(prob)
 
@@ -614,8 +667,27 @@ class ExperimentPipeline:
                 except Exception:
                     pass
 
-            # Position scalar: regime-adjusted baseline, optionally overridden by LLM
+            # ── Dynamic per-step position scalar ─────────────────────── #
             pos_scalar = regime_pos_scalar
+
+            if self.cfg.use_dynamic_risk:
+                # (a) Volatility targeting: scale down in high-vol regimes
+                vol_window = min(20, i + 1)
+                if vol_window >= 5:
+                    recent_p = prices_val.iloc[max(0, i - vol_window + 1): i + 1].values
+                    if len(recent_p) >= 2:
+                        daily_vol = float(np.std(np.diff(np.log(recent_p + 1e-12))))
+                        vol_target_daily = self.cfg.vol_target / np.sqrt(252)
+                        if daily_vol > 1e-8:
+                            vol_scalar = min(1.0, vol_target_daily / daily_vol)
+                            pos_scalar = pos_scalar * vol_scalar
+
+                # (b) Drawdown circuit breaker: halve positions after large losses
+                current_dd = (_port_cum_val - _port_cum_peak) / (_port_cum_peak + 1e-12)
+                if current_dd < -self.cfg.max_portfolio_dd:
+                    pos_scalar *= 0.5  # reduce exposure during drawdown
+
+            # LLM override (every 20 steps when available)
             if self._llm is not None and i % 20 == 0:
                 try:
                     vol_5d = float(np.std(
@@ -643,6 +715,10 @@ class ExperimentPipeline:
                 )
                 net_ret = signal * pos_scalar * daily_ret - self.cfg.transaction_cost * abs(signal)
                 portfolio_returns.append(net_ret)
+                # Update cumulative portfolio value for drawdown monitoring
+                _port_cum_val *= (1.0 + net_ret)
+                if _port_cum_val > _port_cum_peak:
+                    _port_cum_peak = _port_cum_val
 
         # ── Fold metrics ─────────────────────────────────────────────── #
         ret_arr = np.array(portfolio_returns)

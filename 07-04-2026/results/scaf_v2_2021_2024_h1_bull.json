@@ -1,0 +1,117 @@
+{
+  "config": "ExperimentConfig(ticker='^GSPC', start_date='2021-01-01', end_date='2024-12-31', horizon=1, model_names=['LogReg-L2', 'RandomForest', 'LGBM', 'KNN', 'BiLSTM', 'XGBoost', 'ExtraTrees', 'HistGBT', 'MLP', 'RidgeClass', 'Bagging', 'TabNet', 'GraphNN', 'CatBoost'], n_folds=3, min_train_samples=200, embargo_days=5, transaction_cost=0.0003, position_scalar=1.0, min_model_auc=0.52, auc_weighted_ensemble=True, signal_threshold=0.02, kelly_fraction=1.0, use_dynamic_risk=True, vol_target=0.15, max_portfolio_dd=0.12, use_trend_filter=True, trend_lookback=50, use_conformal=False, conformal_alpha=0.1, calibration_fraction=0.2, use_qlearning=False, ql_qtable_path='results/qlearning_qtable.json', use_dl_regime_detector=True, bull_market_years=[2023, 2024], use_llm=False, llm_cache_ttl=300, results_dir='results')",
+  "cv_results": [
+    {
+      "fold": 0,
+      "n_train": 476,
+      "n_val": 241,
+      "model_auc": {
+        "LogReg-L2": 0.4752037574250587,
+        "RandomForest": 0.4932311092692361,
+        "LGBM": 0.48307777317309025,
+        "KNN": 0.4577980384030944,
+        "BiLSTM": 0.47271722613620665,
+        "ExtraTrees": 0.4841138278767786,
+        "HistGBT": 0.48356126536814475,
+        "MLP": 0.5028318828567482,
+        "RidgeClass": 0.4523414836303357,
+        "Bagging": 0.4769995855781185
+      },
+      "active_models": [
+        "MLP"
+      ],
+      "dl_baseline_name": "BiLSTM",
+      "cum_return": -0.059396842771926056,
+      "sharpe": -0.9096668158314841,
+      "max_drawdown": -0.11232139123185357,
+      "rmse": 0.607793355302706,
+      "dl_baseline_rmse": 0.6610887505373165,
+      "dl_baseline_sharpe": -1.0244967202232131,
+      "dl_baseline_drawdown": -0.2456274462893914,
+      "coverage_rate": NaN,
+      "aci_coverage_rate": NaN,
+      "mean_latency_ms": 0.10707962067790051
+    },
+    {
+      "fold": 1,
+      "n_train": 757,
+      "n_val": 281,
+      "model_auc": {
+        "LogReg-L2": 0.4776119402985075,
+        "RandomForest": 0.440450807188547,
+        "LGBM": 0.4809117676921515,
+        "KNN": 0.4500456899177582,
+        "BiLSTM": 0.5444715199512641,
+        "ExtraTrees": 0.46146816935729507,
+        "HistGBT": 0.45659457812975934,
+        "MLP": 0.4799979693369885,
+        "RidgeClass": 0.501827596710326,
+        "Bagging": 0.472636815920398
+      },
+      "active_models": [
+        "BiLSTM"
+      ],
+      "dl_baseline_name": "BiLSTM",
+      "cum_return": -0.06336081223310325,
+      "sharpe": -1.4740200396947079,
+      "max_drawdown": -0.07476666712512718,
+      "rmse": 0.5450462089459058,
+      "dl_baseline_rmse": 0.5387747742735647,
+      "dl_baseline_sharpe": -1.0316444258589068,
+      "dl_baseline_drawdown": -0.11950552947898327,
+      "coverage_rate": NaN,
+      "aci_coverage_rate": NaN,
+      "mean_latency_ms": 0.22312924531006728
+    }
+  ],
+  "summary": {
+    "n_folds_completed": 2,
+    "n_samples_total": 522,
+    "cumulative_return": -0.122758,
+    "sharpe_ratio": -1.0906,
+    "max_drawdown": -0.1599,
+    "excess_return_vs_bnh": 0.070351,
+    "rmse_brier": 0.57642,
+    "dl_baseline_name": "BiLSTM",
+    "dl_baseline_rmse_brier": 0.599932,
+    "dl_baseline_sharpe": -1.0281,
+    "dl_baseline_max_drawdown": -0.1826,
+    "rmse_reduction_vs_dl_pct": 3.92,
+    "sharpe_improvement_vs_dl_pct": -6.08,
+    "drawdown_reduction_vs_dl_pct": 12.4,
+    "conformal_coverage_rate_static": null,
+    "conformal_coverage_rate_aci": null,
+    "mean_inference_latency_ms": 0.165,
+    "stat_test_vs_bnh": {},
+    "baseline_sharpe_ratios": {
+      "buy_and_hold": -1.1212,
+      "momentum": 1.5324,
+      "mean_reversion": -5.1464,
+      "sma_crossover": 1.0117,
+      "ema_crossover": 1.3066,
+      "rsi_strategy": -4.0157,
+      "bollinger_band": -4.265,
+      "random_strategy": -0.2187,
+      "volatility_scaling": -0.9497,
+      "trend_following": 1.6584,
+      "macd_strategy": 2.5592,
+      "donchian_breakout": 7.5983,
+      "risk_adjusted_momentum": 2.7376,
+      "contrarian": -6.4558,
+      "adaptive_momentum": 0.2103
+    },
+    "mean_model_auc": {
+      "LogReg-L2": 0.4764,
+      "RandomForest": 0.4668,
+      "LGBM": 0.482,
+      "KNN": 0.4539,
+      "BiLSTM": 0.5086,
+      "ExtraTrees": 0.4728,
+      "HistGBT": 0.4701,
+      "MLP": 0.4914,
+      "RidgeClass": 0.4771,
+      "Bagging": 0.4748
+    },
+    "elapsed_seconds": 26.0
+  }
+}

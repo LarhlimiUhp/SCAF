@@ -43,12 +43,42 @@ class LSTMClassModel(BaseModel):
         self.net = None
         self.sc = StandardScaler()
         self._buffer = []
+        # sklearn fallback used when PyTorch is unavailable
+        self._fallback_mlp = None
 
     def fit(self, X, y):
-        if not _TORCH_AVAILABLE or _BiLSTMNet is None:
-            return
         if len(X) <= self.seq_len + 10 or len(np.unique(y)) < 2:
             return
+
+        if not _TORCH_AVAILABLE or _BiLSTMNet is None:
+            # Sklearn fallback: MLP on flattened sliding-window (lag) features.
+            # This approximates the temporal awareness of BiLSTM by presenting
+            # the last seq_len timesteps as a concatenated feature vector.
+            from sklearn.neural_network import MLPClassifier
+            Xs = self.sc.fit_transform(X).astype(np.float32)
+            n = len(Xs) - self.seq_len
+            if n <= 10:
+                return
+            X_seq = np.stack([Xs[i:i + self.seq_len].flatten() for i in range(n)])
+            y_seq = y[self.seq_len:]
+            if len(np.unique(y_seq)) < 2:
+                return
+            self._fallback_mlp = MLPClassifier(
+                hidden_layer_sizes=(128, 64),
+                activation="relu",
+                max_iter=300,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=20,
+            )
+            try:
+                self._fallback_mlp.fit(X_seq, y_seq)
+                self.is_fitted = True
+            except Exception:
+                self.is_fitted = False
+            return
+
         Xs = self.sc.fit_transform(X).astype(np.float32)
         n = len(Xs) - self.seq_len
         if n <= 0:
@@ -56,7 +86,7 @@ class LSTMClassModel(BaseModel):
         X_seq = np.stack([Xs[i:i + self.seq_len] for i in range(n)])
         y_seq = y[self.seq_len:].astype(np.float32)
         self.net = _BiLSTMNet(X.shape[1], self.hidden).to(self.device)
-        opt = torch.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=1e-3)  # Augmenté de 1e-4 à 1e-3
+        opt = torch.optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=1e-3)
         crit = nn.BCELoss()
         self.net.train()
         for _ in range(self.epochs):
@@ -71,13 +101,23 @@ class LSTMClassModel(BaseModel):
         self.is_fitted = True
 
     def predict_proba_one(self, X_row):
-        if not self.is_fitted or self.net is None:
+        if not self.is_fitted:
             return 0.5, 0.25
         x = np.array(X_row).flatten()
         self._buffer.append(x)
         if len(self._buffer) < self.seq_len:
             return 0.5, 0.25
         seq = np.array(self._buffer[-self.seq_len:])
+
+        if self._fallback_mlp is not None:
+            # sklearn fallback inference
+            try:
+                xs = self.sc.transform(seq).astype(np.float32).flatten()
+                p = float(self._fallback_mlp.predict_proba(xs.reshape(1, -1))[0, 1])
+                return p, p * (1 - p)
+            except Exception:
+                return 0.5, 0.25
+
         try:
             xs = self.sc.transform(seq).astype(np.float32)
             t = torch.tensor(xs, dtype=torch.float32).unsqueeze(0).to(self.device)
