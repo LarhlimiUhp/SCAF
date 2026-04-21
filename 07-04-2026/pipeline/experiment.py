@@ -78,6 +78,12 @@ class ExperimentConfig:
     # ----- DL Regime Detector -----
     use_dl_regime_detector: bool = True
 
+    # ----- Bull-market validation filter -----
+    # When set, validation indices are restricted to years in this list so
+    # that performance is evaluated only on bull-market phases (e.g. 2019,
+    # 2023, 2024).  Set to None (default) to use all validation years.
+    bull_market_years: Optional[List[int]] = None
+
     # ----- LLM -----
     use_llm: bool = True
     llm_cache_ttl: int = 300
@@ -385,6 +391,29 @@ class ExperimentPipeline:
             logger.error("No valid walk-forward splits found.")
             return []
 
+        # ── Bull-market year filter ───────────────────────────────────── #
+        if self.cfg.bull_market_years:
+            filtered_splits = []
+            for train_idx, val_idx in splits:
+                mask = np.array([
+                    prices.index[i].year in self.cfg.bull_market_years
+                    for i in val_idx
+                ])
+                filtered_val = val_idx[mask]
+                if len(filtered_val) >= 30:
+                    filtered_splits.append((train_idx, filtered_val))
+                else:
+                    logger.warning(
+                        "Bull-market filter removed fold (only %d val samples left). "
+                        "Keeping original val indices.", len(filtered_val)
+                    )
+                    filtered_splits.append((train_idx, val_idx))
+            splits = filtered_splits
+            logger.info(
+                "Bull-market year filter applied (years=%s). %d folds retained.",
+                self.cfg.bull_market_years, len(splits),
+            )
+
         fold_results = []
         for fold_idx, (train_idx, val_idx) in enumerate(splits):
             logger.info(
@@ -417,6 +446,10 @@ class ExperimentPipeline:
         n_cal = max(50, int(len(X_train) * self.cfg.calibration_fraction))
         X_fit, y_fit = X_train[:-n_cal], y_train[:-n_cal]
         X_cal, y_cal = X_train[-n_cal:], y_train[-n_cal:]
+
+        # Keep raw (un-scaled) X_val for the regime detector, which needs
+        # absolute-scale feature values for heuristic thresholds and GMM centroids.
+        X_val_raw = X_val.copy()
 
         # Per-fold feature scaling: fit only on X_fit to avoid data leakage
         _fold_scaler = StandardScaler()
@@ -470,7 +503,8 @@ class ExperimentPipeline:
             _aci_ensemble.calibrate(X_cal, y_cal)
 
         # ── Regime detection (used for model selection and signal scaling) ── #
-        regime_label = self._infer_regime(X_val, prices_val)
+        # Pass raw (un-scaled) X_val so the GMM/heuristic fallback thresholds work.
+        regime_label = self._infer_regime(X_val_raw, prices_val)
         recent_sharpe = _rolling_sharpe(np.diff(np.log(prices_val.values + 1e-12)))
 
         # ── AUC-filtered model pool: drop models below min_model_auc ─── #
@@ -708,10 +742,19 @@ class ExperimentPipeline:
     def _infer_regime(self, X_val: np.ndarray, prices_val: pd.Series) -> str:
         """Infer market regime from recent data features.
 
-        Priority: (1) DL-based BiLSTM regime detector, (2) LLM orchestrator,
+        Priority: (1) DL/GMM regime detector, (2) LLM orchestrator,
         (3) rule-based volatility heuristic.
+
+        Parameters
+        ----------
+        X_val:
+            Raw (un-scaled) feature matrix for the validation window.
+            This is required so the GMM centroids and absolute-scale
+            heuristic thresholds are meaningful.
+        prices_val:
+            Price series aligned with X_val.
         """
-        # ── (1) DL-based regime detection (primary) ──────────────────── #
+        # ── (1) Regime detector (BiLSTM or GMM fallback) ─────────────── #
         if self._regime_detector is not None:
             try:
                 return self._regime_detector.predict(X_val)
@@ -733,7 +776,7 @@ class ExperimentPipeline:
             except Exception:
                 pass
 
-        # ── (3) Rule-based fallback — use actual VIX column when available ── #
+        # ── (3) Rule-based fallback using raw VIX column ─────────────── #
         recent_n = min(20, len(prices_val))
         if recent_n > 2:
             recent_prices = prices_val.values[-recent_n:]
@@ -741,19 +784,11 @@ class ExperimentPipeline:
         else:
             vol_est = 0.01
 
-        # Extract real VIX level from the feature matrix (unscaled proxy)
+        # X_val is now raw (un-scaled) so we can read the VIX column directly.
         vix_level = 20.0
         vix_col = getattr(self, "_vix_col_idx", None)
         if vix_col is not None and X_val.shape[1] > vix_col and len(X_val) > 0:
-            raw_vix = float(np.nanmean(np.abs(X_val[-min(5, len(X_val)):, vix_col])))
-            # After StandardScaler the column is z-scored; restore scale heuristically:
-            # VIX mean≈20, std≈8 → if z > 1.5 → VIX>32 → crisis
-            if raw_vix > 1.5:
-                vix_level = 35.0
-            elif raw_vix > 0.8:
-                vix_level = 25.0
-            else:
-                vix_level = 18.0
+            vix_level = float(np.nanmean(X_val[-min(5, len(X_val)):, vix_col]))
 
         return _detect_regime(vol_est, vix=vix_level)
 
